@@ -27,6 +27,28 @@ describe('repository hygiene', () => {
     expect(scanText(`${'a'.repeat(65)}`, new Set())).toHaveLength(0);
   });
 
+  it('the secret scanner also flags 32-byte seeds written as base64url or base64', () => {
+    // Built at runtime from arbitrary bytes, so this file never contains one.
+    const bytes = Buffer.from(Array.from({ length: 32 }, (_, i) => (i * 73 + 29) & 0xff));
+    const url = bytes.toString('base64url');
+    const std = bytes.toString('base64');
+    expect(url).toHaveLength(43);
+    expect(std).toHaveLength(44);
+    expect(scanText(`SIGN_SEED=${url}\n`, new Set())).toHaveLength(1);
+    expect(scanText(`"seed": "${std}"`, new Set())).toHaveLength(1);
+    expect(scanText(`const k = '${url}';`, new Set())).toHaveLength(1); // random-looking, no name needed
+    expect(scanText(`SIGN_SEED=${url}\n`, new Set([url]))).toHaveLength(0); // allow-listed test vector
+    // A low-entropy test seed (32 x 0x01) is flagged next to a seed name, not on its own.
+    const ones = Buffer.alloc(32, 1).toString('base64url');
+    expect(scanText(`signing_key: ${ones}`, new Set())).toHaveLength(1);
+    expect(scanText(`task: ${ones}`, new Set())).toHaveLength(0);
+    // Not seeds: other lengths, 86-char signatures, kebab-case identifiers, sha512 integrity.
+    expect(scanText(`sig=${Buffer.alloc(64, 7).toString('base64url')}`, new Set())).toHaveLength(0);
+    expect(scanText(`x ${url.slice(0, 42)} y ${url}A z`, new Set())).toHaveLength(0);
+    expect(scanText(`technocore-watch-core-unofficial-community-in`, new Set())).toHaveLength(0);
+    expect(scanText(`"integrity": "sha512-${Buffer.alloc(64, 9).toString('base64')}"`, new Set())).toHaveLength(0);
+  });
+
   it('no tracked or pending file contains a non-allow-listed 64-hex string', () => {
     const out = execFileSync(process.execPath, [join(root, 'scripts', 'secret-scan.mjs')], { cwd: root, encoding: 'utf8' });
     expect(out).toContain('secret-scan: ok');

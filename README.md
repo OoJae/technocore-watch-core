@@ -37,6 +37,23 @@ Known gaps (honest list):
 - `GET /r/<room>/export` is the only way to recover what a tail read skipped (no `before=` paging
   upstream, see #775), so a backfill can cost up to one ring download (bounded to 12 MiB / 2,000 records
   by default, one export at a time per origin).
+- `startFrom: 'now'` on a room whose read view is empty (reaped with a floor, or an `e-` room whose
+  records all expired) cannot learn the real high-water mark from the view, so the first records it
+  sees settle the start. If more than a ring's worth is posted before that first poll, loss below the
+  oldest retained record is not reported for that first step.
+- An origin whose generation goes *down* (its data root was reset or restored) is resynced as a
+  restart only after 3 consecutive lower-generation observations and a fresh cache-busted read that
+  confirms it, so a proxy that replays an old-generation body 3+ times in a row, including the
+  confirmation read, could still force a false restart.
+- Poller lock takeover on the same host relies on `ps -o lstart=` to tell pid reuse from a live holder
+  whose heartbeat is old (a sleeping laptop). Where `ps` is unavailable (Windows) a live pid's lock is
+  only taken over after 15 minutes without a heartbeat. A holder that loses the lock notices on its next
+  heartbeat (10 s) and stops, so two pollers can overlap for at most that long.
+- The secret scan's base64 rule is a heuristic: a 43/44-character 32-byte token is flagged when it looks
+  random (upper, lower and a digit) or follows a seed/secret/key name. A low-entropy seed pasted
+  without a name next to it is not caught.
+- `npm run bench` runs `bench/run.ts` directly and needs Node >= 22.18 (built-in type stripping). The
+  library, the CLI and `npm test` also run on Node 20 (verified locally on 20.20.2, see below).
 
 ## Why it exists (the "8 -> 3" bug)
 
@@ -106,10 +123,11 @@ const b = createWatcher({ origin: pool.origin, scopeKey: 'session-b', store, poo
 | `unsubscribe(room)` | Remove it and stop its poll (if no other scope shares it). |
 | `pause(room?)` / `resume(room?)` | Stop/restart polling; a resumed room backfills what it missed. |
 | `status()` | Subscriptions with `headSeq`, `notifiedSeq`, `acceptedSeq`, `unread`, gaps, generation, errors, poll mode, next wake. |
-| `readPage(room, { max, maxChars })` | Messages after `acceptedSeq`, ascending and contiguous, reporting gaps; `hasMore` when a budget ended the page (text is never truncated). Every page is marked `untrusted: true`. |
+| `readPage(room, { max, maxChars })` | Messages after `acceptedSeq`, ascending and contiguous, reporting gaps; `hasMore` when a budget ended the page (text is never truncated). `maxChars` (default 16,000) counts the **rendered** size, the escaped JSON line each message becomes in `renderPage`; the first message of a page is always included, so one oversized message can exceed it. Every page is marked `untrusted: true`. |
+| `renderNotice(notice, 'framed' \| 'line')` | `renderNotice` / `renderNoticeLine` bounded by this watcher's `limits.noticeMaxChars`. |
 | `ack(room, throughSeq)` | Advance `acceptedSeq` (monotonic within a generation, clamped to `headSeq`). |
 | `markNotified(noticeId)` | The harness confirms a notice was delivered; advances `notifiedSeq`. |
-| `onNotice(fn)` / `onEvent(fn)` | Coalesced notices / trace events (`poll-start`, `poll-end`, `activity`, `rate-limited`, `wait-not-held`, `backfill`, `gap`, `recreated`, `regression`, `network-error`, ...). |
+| `onNotice(fn)` / `onEvent(fn)` | Coalesced notices / trace events (`poll-start`, `poll-end`, `activity`, `rate-limited`, `wait-not-held`, `backfill`, `gap`, `recreated`, `regression`, `stale-generation`, `network-error`, ...). |
 | `sync()` | Reload state changed by another process (also runs every `syncIntervalMs`). |
 | `dispose()` / `await using` | Abort, drain, flush, release. |
 
@@ -135,6 +153,23 @@ emits `recreated` and keeps its cursors; if the sequence restarted at or below `
 lost) it emits `recreated` **and** `regression`, resets the cursors to 0, delivers the new generation from
 its start, and records the unread old-generation range as a `seq-regression` gap. `generation` is live on
 v0.13.0 but missing from the published OpenAPI read schema, so it is treated as optional.
+
+Every view whose generation differs from the one a subscription settled is handed to it, even when
+the view is empty, until that subscription has processed it. A recreation whose export failed once is
+therefore retried on the next poll, and a scope that restarts with an older stored generation still
+sees the change when another scope in the same pool already follows the new one.
+
+**Origin reset.** A response with a *lower* generation than the stored one is normally a stale or
+replayed response, so it is ignored and retried with backoff instead of being polled in a tight loop,
+and a `stale-generation` event is emitted. If the lower generation persists for 3 consecutive
+observations and a fresh cache-busted read confirms it, the origin's data root was reset or restored
+(for example a dev server restarted on a fresh `CHAT_ROOT`). The watcher then resyncs as a restart:
+`recreated` (`from` > `to`) plus `regression`, cursors reset, and the new store's messages delivered.
+
+**`startFrom: 'now'` on an empty view.** The read view reports `last_seq: 0` for a reaped room that kept
+its floor and for an `e-` room whose records all expired. The subscription is then marked
+`headUnsettled`, and the first records it observes settle the start: seqs below the oldest record
+posted after subscribing are neither delivered nor reported as a gap.
 
 ### Polling, budgets and backoff
 
@@ -171,7 +206,8 @@ rooms_json: [{"room":"lobby","generation":3,"new":8,"seq":[101,108],"gaps":[],"r
 Every third-party value is emitted inside a JSON string escaped to printable ASCII, so newlines, bidi
 overrides, zero-width characters or a forged banner cannot break the frame. Notices carry counts and
 ranges, never message text (unless `previewChars > 0`, which is off by default and labelled
-`preview_untrusted`). The output never exceeds `noticeMaxChars` (1,500). `renderNoticeLine` is the
+`preview_untrusted`). `renderNotice(notice, { maxChars })` never exceeds `maxChars` (default 1,500) unless the
+fixed frame plus one room already does; `watcher.renderNotice()` and the CLI pass `limits.noticeMaxChars`. `renderNoticeLine` is the
 one-line form for monitors; `renderPage` frames inbox pages as one escaped JSON line per message.
 
 ### Default bounds
@@ -182,7 +218,8 @@ one-line form for monitors; `renderPage` frames inbox pages as one escaped JSON 
 | Concurrent requests / long-polls per origin | 4 / 3 |
 | Page size / `maxPageChars` | 50 (max 200) / 16,000 |
 | Notice text / preview characters | 1,500 / 0 (max 280) |
-| Gap records per room | 8 (settled ones pruned, oldest merged) |
+| Gap records per room | 8 (settled ones pruned; touching gaps of the same reason merged; beyond that whole records dropped, oldest `backfill-bounded` first, so a gap never widens over delivered or retained seqs and `unread` can only over-count) |
+| Message cache | 2,000 messages per room, 64 rooms (least recently used evicted); a room is dropped when its last subscriber leaves |
 | Backfill | 12 MiB, 2,000 records, one export at a time |
 | State file / notices journal | 256 KiB / 256 KiB ring |
 | Subscription GC | idle > 7 days with nothing unread (matches server deletion) |
@@ -190,7 +227,12 @@ one-line form for monitors; `renderPage` frames inbox pages as one escaped JSON 
 ### State on disk
 
 `<dataDir>/v1/<sha256(scopeKey)[:16]>/state.json` (+ `notices.jsonl`), and `<dataDir>/v1/poller.lock`
-(`{pid, startedAt, heartbeatAt}`, stale after 3 missed heartbeats or a dead pid). Writes are tmp file +
+(`{pid, startedAt, heartbeatAt, owner, hostname}`). A lock held by a live process on the same host is
+never taken over just because its heartbeat is old (a sleeping laptop). It is taken over when the pid is
+dead, when the pid started after the last heartbeat (pid reuse, read with `ps -o lstart=`), or after 15
+minutes without a heartbeat where the start time cannot be read. A lock from another host (a shared
+directory) is stale after 3 missed heartbeats. The holder checks ownership on every heartbeat, and a
+holder whose lock was taken over stops polling (`StoreLock.onLost` / `isHeld`). Writes are tmp file +
 fsync + rename + directory fsync under a short per-scope mutex, with a revision compare-and-set; a
 conflicting writer reloads and re-applies its own field-level changes. Files are `0600`, directories
 `0700`. The store holds cursors only — never message text, never credentials.
@@ -206,13 +248,22 @@ technocore-watch status      [--json]
 technocore-watch inbox       [room] [--max N] [--peek] [--format framed|json]
 
 common: --data <dir> --scope <key> --origin <url> --verbose
-        --quiet-ms --max-delay-ms --min-wake-ms --wait-seconds --sync-ms
+        --quiet-ms --max-delay-ms --min-wake-ms --wait-seconds --sync-ms --notice-max-chars
 ```
 
 - `run` takes the poller lock for the data directory (exit code 3 if another process holds it), polls
-  every scope found there, journals each notice and prints one line per notice.
+  every scope found there, journals each notice and prints one line per notice. If another process takes
+  the lock over, it stops polling and exits with code 3.
 - `monitor` becomes the poller if it gets the lock; otherwise it tails the notices journal and prints one
   framed line per new notice (and takes over if the poller goes away). Built for Claude Code monitors.
+  The journal is a ring that gets rewritten every few hundred notices. The follower detects the
+  rewrite (new inode or a shorter file) and resumes after the last notice id it printed, so each notice
+  is printed once.
+- `--notice-max-chars` (default 1,500) bounds each printed notice. `TECHNOCORE_WATCH_LOCK_HEARTBEAT_MS`
+  changes the lock heartbeat (default 10,000; used by tests).
+- The bin runs only when it is the process entry point, directly or through a symlink such as npm's
+  `.bin` shim. A wrapper script that imports `technocore-watch-core/cli` and calls `main()` is not also
+  run automatically, even when the wrapper is named `technocore-watch`.
 - `inbox` pages from `acceptedSeq` and acks; `--peek` does not ack.
 - Defaults: `--data $TECHNOCORE_WATCH_DATA` or `~/.local/state/technocore-watch`,
   `--origin $TECHNOCORE_URL` or `https://technocore.chat`, `--scope default`.
@@ -231,8 +282,10 @@ dependencies (n8n community nodes) can copy it verbatim and pin a hash.
 - **Room text is untrusted data.** It is only ever rendered inside the fixed frames above. Nothing in this
   package acts on message content.
 - **No secrets.** This package never signs. A pre-commit hook (`npm run hooks:install`) and `npm test`
-  run `scripts/secret-scan.mjs`, which fails on any 64-hex-character string that is not an allow-listed
-  public test vector. Test signing in the harness uses a fixed public test seed (32 bytes of `0x01`).
+  run `scripts/secret-scan.mjs`. It fails on any 64-hex-character string that is not an allow-listed
+  public test vector. It also fails on a 43-character base64url or 44-character base64 token that decodes
+  to 32 bytes (other accepted seed encodings) when the token looks random or follows a seed, secret or
+  key name. Test signing in the harness uses a fixed public test seed (32 bytes of `0x01`).
 - **No production load.** Tests and benchmarks only run against a disposable local technocore-chat.
 
 ## Test results
@@ -241,9 +294,9 @@ dependencies (n8n community nodes) can copy it verbatim and pin a hash.
 
 | Project | What |
 |---|---|
-| `unit` | protocol parsing/sweep/render, reconcile examples, limits, coalescer and scheduler under fake timers, stores, read-only transport, protocol purity, engine end-to-end on an in-memory origin model under fake time |
-| `property` | fast-check: delivered-or-gapped invariant, idempotence, monotonic `acceptedSeq`, notice totals |
-| `integration` | local technocore-chat v0.13.0 per file + counting/fault-injecting proxy: the 12 scenarios below, the CLI, and Python sweep parity |
+| `unit` | protocol parsing/sweep/render, reconcile examples (incl. origin reset and gap bounding), limits, coalescer and scheduler under fake timers, stores and the poller lock (live holder, pid reuse, takeover detection), read-only transport and its socket-closing `close()`, protocol purity, secret scan (hex and base64 seeds), engine end-to-end on an in-memory origin model under fake time (incl. a recreation whose export fails once, an origin whose generation goes down, `now` on reaped/expired rooms, notice/page/cache bounds), the CLI `monitor` follower across journal rewrites and `run` losing its lock |
+| `property` | fast-check: delivered-or-gapped invariant, idempotence, monotonic `acceptedSeq`, notice totals, unsettled `now` starts never gapping pre-subscription seqs, `boundGaps` never widening a gap |
+| `integration` | local technocore-chat v0.13.0 per file + counting/fault-injecting proxy: the 12 scenarios below, the CLI, CLI entry-point detection (symlink vs. same-named wrapper), and Python sweep parity |
 
 Integration scenarios (each against the real server):
 
@@ -258,17 +311,20 @@ Integration scenarios (each against the real server):
 9. `CHAT_MAX_WAITERS_PER_IP=1` held elsewhere: `wait_held:false` sleeps, no tight loop
 10. two scopes in one pool: independent cursors, <= 3 long-polls, one upstream poll per shared room
 11. restart with the same store: no re-notify
-12. dispose: no timers or sockets left (a child process exits on its own), proxy sees the close
+12. dispose: no timers or sockets left the moment `dispose()` resolves (a plain-ESM child running `dist/`
+    exits on its own), proxy sees the close
 
 Running them needs `uv` and a technocore-chat checkout at v0.13.0 with `uv sync --frozen` done, found at
 `$TECHNOCORE_CHECKOUT` or `../.cache/technocore-chat`. `npm run test:fast` skips the two slow scenarios
 (`TECHNOCORE_SKIP_SLOW=1`); `npm test` runs everything.
 
 <!-- test-results:start -->
-Last full `npm test` (2026-09-13, Apple M5 16 GB, macOS 26, Node 26.0.0, uv 0.11.14, technocore-chat
-v0.13.0 @20a4457, slow scenarios included): build + typecheck + secret scan OK, then
-**22 test files, 94 tests passed, 0 failed, 0 skipped** — unit 77, property 2 (400 + 300 fast-check runs
-by default; also run once with `FC_NUM_RUNS=20000`, passing), integration 15 — in 64 s wall time.
+Last full `npm test` after the independent-review fixes (2026-09-13, Apple M5 16 GB, macOS 26, uv 0.11.14,
+technocore-chat v0.13.0 @20a4457, slow scenarios included): build + typecheck + secret scan OK, then
+**27 test files, 115 tests passed, 0 failed, 0 skipped** — unit 94, property 4 (400 / 300 / 300 / 300
+fast-check runs by default; also run once with `FC_NUM_RUNS=20000`, passing), integration 17 — on
+**Node 26.0.0** and again, with the same result, on **Node 20.20.2** (integration children included).
+Scenario 12 passed 4 times in a row on its own, and in both full runs.
 <!-- test-results:end -->
 
 ## Benchmark
@@ -282,7 +338,9 @@ messages, against a local server at production-like settings (`CHAT_WAIT_POLL=0.
 replies, notices and duplicate notified seqs after the restart. Results: `bench/results/`.
 
 <!-- bench-results:start -->
-Full W1 run (`bench/results/2026-09-13-488d6e8-scale1.md`, Apple M5 16 GB, Node 26.0.0, one run):
+Full W1 run (`bench/results/2026-09-13-488d6e8-scale1.md`, Apple M5 16 GB, Node 26.0.0, one run). It was
+recorded before the review fixes. After the fixes, only a scale-0.05 smoke run was made (0 duplicate
+notified seqs, 0 of 105 posts left out of a notice, 0 429s); its output was not kept.
 
 | Wake latency, post 200 -> notice (ms) | n | p50 | p95 | max |
 |---|---|---|---|---|
@@ -308,7 +366,7 @@ Full W1 run (`bench/results/2026-09-13-488d6e8-scale1.md`, Apple M5 16 GB, Node 
 | Component | Version |
 |---|---|
 | technocore-chat (local test server) | v0.13.0 @ 20a4457 |
-| Node | 26.0.0 (engines: >= 20) |
+| Node | 26.0.0 and 20.20.2 (engines: >= 20; `npm run bench` needs >= 22.18) |
 | TypeScript / vitest / fast-check | 5.9.3 / 4.1.11 / 4.10.0 |
 
 ## License
