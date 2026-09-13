@@ -70,6 +70,7 @@ export class HostPool {
   private configPromise: Promise<OriginConfig> | undefined;
   private readonly configOverride: Partial<OriginConfig> | undefined;
   originConfig: OriginConfig | undefined;
+  private configAt = 0;
   private memberCount = 0;
   private disposed = false;
 
@@ -126,6 +127,11 @@ export class HostPool {
 
   /** Reads /config once and applies the budget and waiter caps. Never throws (defaults on failure). */
   ensureConfig(): Promise<OriginConfig> {
+    // A /config that failed (origin down at startup) is retried after a minute rather than
+    // pinning conservative defaults for the life of the process.
+    if (this.configPromise && this.originConfig?.fallback && this.clock.now() - this.configAt > 60_000) {
+      this.configPromise = undefined;
+    }
     if (!this.configPromise) {
       this.configPromise = (async () => {
         let cfg: OriginConfig;
@@ -140,6 +146,7 @@ export class HostPool {
           if (this.configOverride) cfg = { ...cfg, ...this.configOverride };
         }
         this.originConfig = cfg;
+        this.configAt = this.clock.now();
         const rpm = this.limits.readsPerMinute ?? cfg.readsPerMinute;
         this.governor.configure(rpm * this.limits.readBudgetFraction);
         // Leave one of the origin's per-IP waiter slots for other clients on this host.

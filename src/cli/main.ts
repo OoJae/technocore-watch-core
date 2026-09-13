@@ -224,14 +224,20 @@ async function runPoller(p: Parsed, io: CliIo, lock: StoreLock, store: FileState
   }
 }
 
-async function followNotices(p: Parsed, io: CliIo, store: FileStateStore, stop: AbortSignal): Promise<'stopped' | 'lock'> {
+async function followNotices(
+  p: Parsed,
+  io: CliIo,
+  store: FileStateStore,
+  stop: AbortSignal,
+  offsets: Map<string, number>,
+): Promise<'stopped' | 'lock'> {
   const explicit = scopesOf(p);
-  const offsets = new Map<string, number>();
   const paths = async () => {
     const scopes = explicit.length ? explicit : await store.listScopes();
     return scopes.map((s) => store.noticesPath(s));
   };
   for (const path of await paths()) {
+    if (offsets.has(path)) continue; // keep our place across lock attempts
     try {
       offsets.set(path, (await stat(path)).size);
     } catch {
@@ -355,6 +361,7 @@ export async function main(argv: string[], io: CliIo): Promise<number> {
         const store = new FileStateStore(dataDir(p, io));
         const printMode = one(p, 'print') ?? (p.command === 'monitor' ? 'line' : 'line');
         if (!['line', 'framed', 'json', 'none'].includes(printMode)) throw new UsageError('--print must be line, framed, json or none');
+        const offsets = new Map<string, number>();
         for (;;) {
           const lock = await store.acquireLock('poller');
           if (lock) {
@@ -365,7 +372,7 @@ export async function main(argv: string[], io: CliIo): Promise<number> {
             io.err('technocore-watch: another poller holds the lock for this data directory');
             return 3;
           }
-          const why = await followNotices(p, io, store, stop);
+          const why = await followNotices(p, io, store, stop, offsets);
           if (why === 'stopped') return 0;
         }
       }

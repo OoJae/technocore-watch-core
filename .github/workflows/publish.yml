@@ -1,0 +1,23 @@
+# Publishing is a manual, approved step. This workflow only runs on a pushed version tag,
+# uses npm trusted publishing (OIDC) with provenance, and never runs from a fork.
+name: publish
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  publish:
+    if: github.repository_owner == 'OoJae'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      - run: npm run build
+      - run: npm pack --dry-run
+      - run: npm publish --provenance --access public

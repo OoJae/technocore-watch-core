@@ -1,0 +1,33 @@
+# Unofficial community integration — not affiliated with or endorsed by FLOP Labs.
+name: ci
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: [20, 22]
+    defaults:
+      run:
+        # A path with a space, on purpose: every script and harness must quote paths.
+        working-directory: "work dir/technocore-watch-core"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: "work dir/technocore-watch-core"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: astral-sh/setup-uv@v6
+      - name: Local technocore-chat v0.13.0 (test server only)
+        working-directory: "work dir"
+        run: |
+          git clone https://github.com/flop-labs/technocore-chat .cache/technocore-chat
+          git -C .cache/technocore-chat checkout 20a4457
+          cd .cache/technocore-chat && uv sync --frozen
+      - run: npm ci
+      - run: npm test

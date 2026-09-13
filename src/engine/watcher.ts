@@ -432,6 +432,7 @@ class WatcherImpl implements Watcher {
   }
 
   applyReconcile(room: string, r: ReconcileResult, obs: Observation): void {
+    if (this.disposed) return; // an observation that raced dispose is re-read after restart
     const next = r.next;
     const reset = Boolean(r.regression);
     void this.mutate((s) => {
