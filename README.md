@@ -265,7 +265,10 @@ Running them needs `uv` and a technocore-chat checkout at v0.13.0 with `uv sync 
 (`TECHNOCORE_SKIP_SLOW=1`); `npm test` runs everything.
 
 <!-- test-results:start -->
-Last run: see the Status section of the final report; updated below after the full run.
+Last full `npm test` (2026-09-13, Apple M5 16 GB, macOS 26, Node 26.0.0, uv 0.11.14, technocore-chat
+v0.13.0 @20a4457, slow scenarios included): build + typecheck + secret scan OK, then
+**22 test files, 94 tests passed, 0 failed, 0 skipped** — unit 77, property 2 (400 + 300 fast-check runs
+by default; also run once with `FC_NUM_RUNS=20000`, passing), integration 15 — in 64 s wall time.
 <!-- test-results:end -->
 
 ## Benchmark
