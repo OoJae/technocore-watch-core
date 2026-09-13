@@ -7,10 +7,12 @@
 //   * acceptedSeq never decreases within a generation
 //   * re-applying the identical input is a no-op (duplicate delivery is idempotent)
 //   * notice counts equal delivered and gapped totals
+//   * a 'now' start on an empty view (reaped room with a floor, fully expired e- room) settles on
+//     the first records and never reports a seq that predates the subscription as a gap
 import fc from 'fast-check';
 import { describe, expect, it } from 'vitest';
-import { applyAck, newSubscription, reconcile, type ReconcileResult } from '../../src/protocol/reconcile.ts';
-import type { ExportScan, ReadView, SubscriptionState } from '../../src/protocol/types.ts';
+import { applyAck, boundGaps, newSubscription, reconcile, unreadCount, type ReconcileResult } from '../../src/protocol/reconcile.ts';
+import type { ExportScan, GapRecord, ReadView, SubscriptionState } from '../../src/protocol/types.ts';
 import { Coalescer, type FlushBatch } from '../../src/engine/coalescer.ts';
 import { ServerModel } from '../harness/model.ts';
 
@@ -99,7 +101,12 @@ function settle(
   return out;
 }
 
-function runScenario(ops: Op[], opts: { checkNotices: boolean }) {
+interface UnsettledStart {
+  pre: number;
+  mode: 'reap' | 'expire';
+}
+
+function runScenario(ops: Op[], opts: { checkNotices: boolean; unsettled?: UnsettledStart }) {
   const model = new ServerModel();
   const truth: Truth = { text: new Map() };
   let textCounter = 0;
@@ -112,6 +119,18 @@ function runScenario(ops: Op[], opts: { checkNotices: boolean }) {
   };
   post(1);
   let sub = newSubscription(ROOM, now);
+  // Seqs (per generation) that existed before an unsettled 'now' subscription: never a gap.
+  const preSubscribe = new Set<string>();
+  if (opts.unsettled) {
+    post(opts.unsettled.pre);
+    if (opts.unsettled.mode === 'reap') model.reap(ROOM);
+    else model.expireAll(ROOM);
+    for (let s = 1; s <= model.lastSeq(ROOM); s++) preSubscribe.add(`${model.generation(ROOM)}:${s}`);
+    // What resolveStart('now') stores for an empty view: last_seq 0, the view's generation.
+    const probe = model.read(ROOM, undefined, 1);
+    expect(probe.messages).toEqual([]);
+    sub = { ...sub, headSeq: probe.last_seq, generation: probe.generation!, headUnsettled: true };
+  }
   const history: { since: number; view: ReadView }[] = [];
   let last: { since: number; view: ReadView; backfill?: ExportScan } | undefined;
   // Seqs settled (delivered or gapped) in the current epoch; reset on regression.
@@ -127,7 +146,12 @@ function runScenario(ops: Op[], opts: { checkNotices: boolean }) {
       expect(res.next).toEqual(prev);
       return;
     }
-    const from = res.regression ? 0 : prev.headSeq;
+    const from = res.settledStart ?? (res.regression ? 0 : prev.headSeq);
+    if (res.settledStart !== undefined) {
+      expect(prev.headUnsettled).toBe(true);
+      expect(res.next.headUnsettled).toBeUndefined();
+      expect(res.next.acceptedSeq).toBeGreaterThanOrEqual(res.settledStart);
+    }
     const to = res.next.headSeq;
     if (!res.regression && prev.generation !== undefined && res.next.generation === prev.generation) {
       expect(to).toBeGreaterThanOrEqual(from);
@@ -150,6 +174,9 @@ function runScenario(ops: Op[], opts: { checkNotices: boolean }) {
       expect(m.text).toBe(want);
     }
     const currentGaps = res.gaps.filter((g) => g.reason !== 'seq-regression');
+    for (const g of res.gaps) {
+      for (let s = g.from; s <= g.to; s++) expect(preSubscribe.has(`${g.generation}:${s}`)).toBe(false);
+    }
     for (const g of currentGaps) {
       expect(g.to).toBeGreaterThanOrEqual(g.from);
       for (let s = g.from; s <= g.to; s++) covered.push(s);
@@ -247,7 +274,7 @@ function runScenario(ops: Op[], opts: { checkNotices: boolean }) {
   check(sub, final.r, final.backfill);
   if (!final.r.needsBackfill && !final.r.ignored) sub = final.r.next;
   const room = model.rooms.get(ROOM)!;
-  if (room.exists && (sub.generation === room.generation || sub.generation === undefined)) {
+  if (room.exists && !sub.headUnsettled && (sub.generation === room.generation || sub.generation === undefined)) {
     expect(sub.headSeq).toBe(model.lastSeq(ROOM));
   }
   if (opts.checkNotices) {
@@ -264,6 +291,45 @@ describe('reconcile properties', () => {
     fc.assert(
       fc.property(fc.array(opArb(true), { minLength: 1, maxLength: 60 }), (ops) => runScenario(ops, { checkNotices: false })),
       { numRuns: Number(process.env.FC_NUM_RUNS ?? 400) },
+    );
+  });
+
+  it("an unsettled 'now' start never reports pre-subscription seqs as lost", () => {
+    const startArb = fc.record({ pre: fc.integer({ min: 1, max: 80 }), mode: fc.constantFrom('reap' as const, 'expire' as const) });
+    fc.assert(
+      fc.property(startArb, fc.array(opArb(true), { minLength: 1, maxLength: 60 }), (unsettled, ops) => runScenario(ops, { checkNotices: false, unsettled })),
+      { numRuns: Number(process.env.FC_NUM_RUNS ?? 300) },
+    );
+  });
+
+  it('boundGaps only ever keeps seqs an input gap of the same reason covered, and never under-counts unread', () => {
+    const gapArb = fc.record({
+      from: fc.integer({ min: 1, max: 400 }),
+      len: fc.integer({ min: 0, max: 30 }),
+      reason: fc.constantFrom('ring-dropped' as const, 'backfill-bounded' as const, 'seq-regression' as const),
+      generation: fc.constantFrom(1, 2),
+    });
+    fc.assert(
+      fc.property(fc.array(gapArb, { maxLength: 24 }), fc.integer({ min: 0, max: 200 }), fc.integer({ min: 0, max: 10 }), (raw, acceptedSeq, max) => {
+        const at = now.toISOString();
+        const gaps: GapRecord[] = raw.map((g) => ({ from: g.from, to: g.from + g.len, reason: g.reason, generation: g.generation, detectedAt: at }));
+        const sub = { acceptedSeq, generation: 2 };
+        const out = boundGaps(gaps, sub, max);
+        expect(out.length).toBeLessThanOrEqual(max);
+        for (const g of out) {
+          for (let seq = g.from; seq <= g.to; seq++) {
+            expect(gaps.some((o) => o.reason === g.reason && o.generation === g.generation && o.from <= seq && seq <= o.to)).toBe(true);
+          }
+        }
+        const head = 450;
+        const bounded = { ...newSubscription(ROOM, now), generation: 2, headSeq: head, acceptedSeq, gaps: out };
+        const exactGaps = gaps.filter((g) => g.generation === 2);
+        // unread with the bounded list is never below the exact count computed from the union of inputs.
+        const covered = new Set<number>();
+        for (const g of exactGaps) for (let seq = Math.max(g.from, acceptedSeq + 1); seq <= Math.min(g.to, head); seq++) covered.add(seq);
+        expect(unreadCount(bounded)).toBeGreaterThanOrEqual(Math.max(0, head - acceptedSeq - covered.size));
+      }),
+      { numRuns: Number(process.env.FC_NUM_RUNS ?? 300) },
     );
   });
 

@@ -59,6 +59,7 @@ function migrateSub(room: string, raw: unknown): SubscriptionState | null {
   if (typeof s.lastActivityAt === 'string') sub.lastActivityAt = s.lastActivityAt;
   if (typeof s.createdAt === 'string') sub.createdAt = s.createdAt;
   if (s.startFrom === 'now' || s.startFrom === 'retained') sub.startFrom = s.startFrom;
+  if (s.headUnsettled === true) sub.headUnsettled = true;
   if (typeof s.lastError === 'object' && s.lastError !== null) {
     const e = s.lastError as Record<string, unknown>;
     if (typeof e.kind === 'string' && typeof e.at === 'string') sub.lastError = { kind: e.kind.slice(0, 64), at: e.at };

@@ -59,6 +59,13 @@ export interface SubscriptionState {
   lastError?: { kind: string; at: string };
   /** Set by an offline subscribe; resolved by the engine on its first read. */
   startFrom?: 'now' | 'retained';
+  /**
+   * Set when `startFrom: 'now'` resolved on an empty read view. The view then reports
+   * last_seq 0 whatever the room's real high-water mark is (a reaped room keeps its floor, an
+   * `e-` room's expired records still count), so the first records observed settle the start
+   * position instead of everything below them being reported as lost.
+   */
+  headUnsettled?: boolean;
   createdAt?: string;
 }
 

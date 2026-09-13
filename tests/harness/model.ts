@@ -9,6 +9,8 @@ interface RoomModel {
   exists: boolean;
   generation: number;
   floor: number;
+  /** `e-` expiry: records with seq <= this are unreadable (read and export), but still count for last_seq. */
+  expiredThrough?: number;
 }
 
 export class ServerModel {
@@ -51,6 +53,7 @@ export class ServerModel {
     if (created) {
       r.generation += 1;
       r.floor = 0;
+      delete r.expiredThrough;
     }
     for (const fn of this.listeners) fn(name);
     return m;
@@ -79,10 +82,26 @@ export class ServerModel {
     r.floor = 0;
   }
 
+  /** Every current record of an `e-` room expires: unreadable, but seq keeps advancing past them. */
+  expireAll(name: string): void {
+    const r = this.room(name);
+    r.expiredThrough = this.lastSeq(name);
+  }
+
+  /** The origin's data root is replaced (a restore, or a dev server restarted on a fresh CHAT_ROOT). */
+  resetAll(): void {
+    this.rooms.clear();
+  }
+
+  private readable(r: RoomModel): Message[] {
+    const through = r.expiredThrough ?? 0;
+    return through ? r.records.filter((m) => m.seq > through) : r.records;
+  }
+
   read(name: string, since: number | undefined, limit = 50): ReadView {
     const r = this.room(name);
     const lim = Math.max(1, Math.min(200, limit));
-    let out = r.records.filter((m) => since === undefined || m.seq > since);
+    let out = this.readable(r).filter((m) => since === undefined || m.seq > since);
     out = out.slice(-lim);
     return {
       room: name,
@@ -96,7 +115,7 @@ export class ServerModel {
 
   exportRoom(name: string): { generation: number; records: Message[] } {
     const r = this.room(name);
-    return { generation: r.generation, records: r.records.map((m) => ({ ...m })) };
+    return { generation: r.generation, records: this.readable(r).map((m) => ({ ...m })) };
   }
 
   /** A deep snapshot, for replaying stale responses. */

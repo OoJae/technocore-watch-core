@@ -87,6 +87,7 @@ export type WatchEventType =
   | 'gap'
   | 'recreated'
   | 'regression'
+  | 'stale-generation'
   | 'notice'
   | 'slot-change'
   | 'state-conflict'
@@ -108,6 +109,8 @@ export interface RoomMember {
   prepare(): Promise<boolean>;
   /** Current head, or undefined while not ready. */
   head(): number | undefined;
+  /** The generation this member last settled; a view reporting another one is always forwarded. */
+  generation(): number | undefined;
   active(): boolean;
   onObservation(obs: Observation): Promise<'ok' | 'retry'>;
   onFatal(refusal: Refusal): void;

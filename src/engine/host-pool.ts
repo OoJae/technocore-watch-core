@@ -94,7 +94,7 @@ export class HostPool {
       for (const room of rooms) this.polls.get(room)?.wake();
       this.emit({ type: 'slot-change', detail: { rooms, slotted: this.scheduler.slotted() } });
     });
-    this.cache = new MessageCache(this.limits.cacheMessages);
+    this.cache = new MessageCache(this.limits.cacheMessages, this.limits.maxSubscriptionsPerHost);
   }
 
   get signal(): AbortSignal {
@@ -197,9 +197,14 @@ export class HostPool {
       if (p.members.size === 0) {
         this.polls.delete(member.room);
         this.scheduler.remove(member.room);
+        this.cache.invalidate(member.room);
         const done = p.stop();
         this.stopping.add(done);
-        void done.finally(() => this.stopping.delete(done));
+        void done.finally(() => {
+          this.stopping.delete(done);
+          // An observation that raced the stop may have cached the room again.
+          if (!this.polls.has(member.room)) this.cache.invalidate(member.room);
+        });
       }
     };
   }
@@ -332,6 +337,12 @@ export class HostPool {
   }
 }
 
+/** True when the view names a generation that some member has not settled yet. */
+function generationUnsettled(members: readonly RoomMember[], generation: number | undefined): boolean {
+  if (generation === undefined) return false;
+  return members.some((m) => m.generation() !== generation);
+}
+
 export class RoomPoller {
   readonly room: string;
   readonly members = new Set<RoomMember>();
@@ -341,7 +352,6 @@ export class RoomPoller {
   private woken = false;
   private loop: Promise<void> | undefined;
   private readonly backoff: DecorrelatedJitter;
-  private knownGeneration: number | undefined;
   private nextSweepAt = 0;
 
   constructor(pool: HostPool, room: string) {
@@ -446,8 +456,7 @@ export class RoomPoller {
           result = await pool.read({ room, since, limit: 1 }, this.signal);
           if (result.ok) {
             const v = result.view;
-            const changed = v.generation !== undefined && this.knownGeneration !== undefined && v.generation !== this.knownGeneration;
-            if (v.messages.length > 0 || changed || this.knownGeneration === undefined) {
+            if (v.messages.length > 0 || generationUnsettled(ready, v.generation)) {
               if (v.messages.length > 0) pool.scheduler.noteActivity(room);
               result = await pool.read({ room, since, limit: 200, cacheBust: true }, this.signal);
             }
@@ -477,9 +486,11 @@ export class RoomPoller {
         continue;
       }
       const view = result.view;
-      const genChanged = view.generation !== undefined && this.knownGeneration !== undefined && view.generation !== this.knownGeneration;
-      const firstView = this.knownGeneration === undefined && view.generation !== undefined;
-      if (view.messages.length === 0 && !genChanged && !firstView) {
+      // An empty view still matters when any member has not settled the generation it reports
+      // (a recreation, a regression, a reset origin, or a member that joined or restarted with an
+      // older stored generation). Compared per member, so a failed step is retried on the next
+      // empty view instead of being remembered as handled.
+      if (view.messages.length === 0 && !generationUnsettled(ready, view.generation)) {
         this.backoff.reset();
         if (transport === 'http-longpoll') {
           if (view.wait_held === false) {
@@ -508,7 +519,6 @@ export class RoomPoller {
             }),
           ),
       );
-      if (view.generation !== undefined) this.knownGeneration = view.generation;
       if (statuses.includes('retry')) {
         await this.nap(this.backoff.next());
       } else {

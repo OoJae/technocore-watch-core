@@ -12,7 +12,8 @@ import { randomUUID } from 'node:crypto';
 import { type Clock, isAbortError, systemClock } from '../limits/clock.ts';
 import { assertRoomName } from '../protocol/names.ts';
 import type { Refusal } from '../protocol/parse.ts';
-import { applyAck, applyNotified, boundGaps, newSubscription, reconcile, unreadCount, type ReconcileResult } from '../protocol/reconcile.ts';
+import { asciiJson, messageJson, renderNotice, renderNoticeLine } from '../protocol/render.ts';
+import { applyAck, applyNotified, boundGaps, gappedCount, newSubscription, reconcile, unreadCount, type ReconcileOptions, type ReconcileResult } from '../protocol/reconcile.ts';
 import type { ExportScan, GapRecord, Message, Notice, SubscriptionState, WatchStateV1 } from '../protocol/types.ts';
 import { RevisionConflictError, emptyState } from '../state/model.ts';
 import type { StateStore } from '../state/store.ts';
@@ -71,7 +72,14 @@ export interface Watcher extends AsyncDisposable {
   pause(room?: string): Promise<void>;
   resume(room?: string): Promise<void>;
   status(): WatchStatus;
+  /**
+   * Messages after acceptedSeq. `maxChars` (default limits.maxPageChars) bounds the RENDERED size:
+   * the escaped JSON line each message becomes in renderPage, not its raw text length. The first
+   * message of a page is always included, so a page can exceed it by at most one message.
+   */
   readPage(room: string, o?: { max?: number; maxChars?: number }): Promise<Page>;
+  /** renderNotice / renderNoticeLine bounded by this watcher's limits.noticeMaxChars. */
+  renderNotice(n: Notice, form?: 'framed' | 'line'): string;
   ack(room: string, throughSeq: number): Promise<void>;
   markNotified(noticeId: string): Promise<void>;
   onNotice(fn: (n: Notice) => void | Promise<void>): () => void;
@@ -94,6 +102,7 @@ class SubscriptionMember implements RoomMember {
   readonly room: string;
   private readonly w: WatcherImpl;
   private chain: Promise<unknown> = Promise.resolve();
+  private staleStreak = 0;
 
   constructor(w: WatcherImpl, room: string) {
     this.w = w;
@@ -109,6 +118,10 @@ class SubscriptionMember implements RoomMember {
     const s = this.sub();
     if (!s || s.startFrom) return undefined;
     return s.headSeq;
+  }
+
+  generation(): number | undefined {
+    return this.sub()?.generation;
   }
 
   active(): boolean {
@@ -136,12 +149,36 @@ class SubscriptionMember implements RoomMember {
     let since = obs.since;
     let view = obs.view;
     let backfill: ExportScan | undefined;
-    for (let attempt = 0; attempt < 4; attempt++) {
+    let originReset = false;
+    for (let attempt = 0; attempt < 5; attempt++) {
       if (w.disposed) return 'ok';
       const sub = this.sub();
       if (!sub || sub.status !== 'active' || sub.startFrom) return 'ok';
-      const r = reconcile(sub, since, view, new Date(w.clock.now()), backfill ? { backfill, maxGaps: w.limits.maxGaps } : { maxGaps: w.limits.maxGaps });
+      const opts: ReconcileOptions = { maxGaps: w.limits.maxGaps };
+      if (backfill) opts.backfill = backfill;
+      if (originReset) opts.originReset = true;
+      const r = reconcile(sub, since, view, new Date(w.clock.now()), opts);
+      if (r.ignored === 'stale-generation') {
+        // Usually a replayed or edge-cached response: retry with backoff (never re-poll at wire
+        // speed). If the lower generation persists across STALE_CONFIRMATIONS observations AND a
+        // fresh cache-busted read still reports it, the origin's data root was reset or restored:
+        // resync from it as a restart instead of staying stuck on a generation that is gone.
+        this.staleStreak++;
+        w.noteStaleGeneration(this.room, sub.generation, view.generation, this.staleStreak);
+        if (this.staleStreak < STALE_CONFIRMATIONS) return 'retry';
+        const res = await pool.read({ room: this.room, since: sub.headSeq, limit: 200, cacheBust: true });
+        if (!res.ok) return 'retry';
+        pool.cache.add(this.room, res.view.generation, res.view.messages);
+        since = sub.headSeq;
+        view = res.view;
+        backfill = undefined;
+        const g = res.view.generation;
+        originReset = g !== undefined && sub.generation !== undefined && sub.generation !== 0 && g < sub.generation;
+        if (!originReset) this.staleStreak = 0;
+        continue;
+      }
       if (r.ignored) return 'ok';
+      if (view.generation === undefined || sub.generation === undefined || view.generation >= sub.generation) this.staleStreak = 0;
       const nb = r.needsBackfill;
       if (nb) {
         if (nb.reason === 'catch-up') {
@@ -158,12 +195,16 @@ class SubscriptionMember implements RoomMember {
         backfill = bf;
         continue;
       }
+      if (r.originReset) this.staleStreak = 0;
       w.applyReconcile(this.room, r, obs);
       return 'ok';
     }
     return 'retry';
   }
 }
+
+/** Consecutive lower-generation observations before a fresh read may confirm an origin reset. */
+const STALE_CONFIRMATIONS = 3;
 
 function gapKey(g: GapRecord): string {
   return `${g.generation ?? ''}|${g.from}|${g.to}|${g.reason}`;
@@ -263,7 +304,7 @@ class WatcherImpl implements Watcher {
       const gaps = sub.gaps.filter(
         (g) => (g.generation === undefined || g.generation === sub.generation) && g.to > sub.notifiedSeq && g.from <= sub.headSeq,
       );
-      const gapped = gaps.reduce((n, g) => n + (Math.min(g.to, sub.headSeq) - Math.max(g.from, sub.notifiedSeq + 1) + 1), 0);
+      const gapped = gappedCount(gaps, sub.generation, sub.notifiedSeq + 1, sub.headSeq);
       const delta: Parameters<Coalescer['add']>[0] = {
         room: sub.room,
         delivered: [],
@@ -414,6 +455,9 @@ class WatcherImpl implements Watcher {
         cur.headSeq = view.last_seq;
         cur.notifiedSeq = view.last_seq;
         cur.acceptedSeq = view.last_seq;
+        // An empty view names no high-water mark (last_seq echoes 0 for a reaped room with a
+        // floor, or an e- room whose records all expired): the first records settle it.
+        if (view.messages.length === 0) cur.headUnsettled = true;
       }
       delete cur.startFrom;
     }, 'now');
@@ -431,6 +475,10 @@ class WatcherImpl implements Watcher {
     this.emitEvent({ type: 'refused', at, room, detail: { kind } });
   }
 
+  noteStaleGeneration(room: string, stored: number | undefined, observed: number | undefined, streak: number): void {
+    this.emitEvent({ type: 'stale-generation', at: this.nowIso(), room, detail: { stored: stored ?? null, observed: observed ?? null, streak } });
+  }
+
   applyReconcile(room: string, r: ReconcileResult, obs: Observation): void {
     if (this.disposed) return; // an observation that raced dispose is re-read after restart
     const next = r.next;
@@ -438,16 +486,26 @@ class WatcherImpl implements Watcher {
     void this.mutate((s) => {
       const cur = s.subscriptions[room];
       if (!cur) return;
-      if (cur.generation !== undefined && next.generation !== undefined && cur.generation > next.generation) return;
+      // A lower generation only ever lands through a confirmed origin reset, and only over the
+      // generation it was confirmed against.
+      const backwards = cur.generation !== undefined && next.generation !== undefined && cur.generation > next.generation;
+      if (backwards && !(r.originReset && r.recreated?.from === cur.generation)) return;
       if (reset) {
         cur.generation = next.generation;
         cur.headSeq = next.headSeq;
         cur.notifiedSeq = next.notifiedSeq;
         cur.acceptedSeq = next.acceptedSeq;
         cur.gaps = next.gaps.map((g) => ({ ...g }));
+        if (next.headUnsettled) cur.headUnsettled = true;
+        else delete cur.headUnsettled;
       } else {
         if (next.generation !== undefined) cur.generation = next.generation;
         cur.headSeq = Math.max(cur.headSeq, next.headSeq);
+        if (r.settledStart !== undefined && cur.headUnsettled) {
+          cur.notifiedSeq = Math.max(cur.notifiedSeq, r.settledStart);
+          cur.acceptedSeq = Math.max(cur.acceptedSeq, r.settledStart);
+          delete cur.headUnsettled;
+        }
         cur.gaps = boundGaps(mergeGapLists(cur.gaps, r.gaps), cur, this.limits.maxGaps);
       }
       if (next.lastActivityAt) cur.lastActivityAt = next.lastActivityAt;
@@ -547,6 +605,11 @@ class WatcherImpl implements Watcher {
 
   flushNotices(): void {
     this.coalescer.flushNow();
+  }
+
+  renderNotice(n: Notice, form: 'framed' | 'line' = 'framed'): string {
+    const opts = { maxChars: this.limits.noticeMaxChars };
+    return form === 'line' ? renderNoticeLine(n, opts) : renderNotice(n, opts);
   }
 
   async markNotified(noticeId: string): Promise<void> {
@@ -691,12 +754,14 @@ class WatcherImpl implements Watcher {
     while (seq <= end && messages.length < max) {
       const cached = this.pool.cache.get(room, generation, seq);
       if (cached) {
-        if (messages.length > 0 && chars + cached.text.length > maxChars) {
+        // Count what renderPage emits (every non-ASCII unit becomes \uXXXX), sender included.
+        const size = asciiJson(messageJson(cached)).length;
+        if (messages.length > 0 && chars + size > maxChars) {
           stoppedEarly = true;
           break;
         }
         messages.push(cached);
-        chars += cached.text.length;
+        chars += size;
         seq++;
         continue;
       }

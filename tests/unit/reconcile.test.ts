@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { applyAck, newSubscription, reconcile, unreadCount } from '../../src/protocol/reconcile.ts';
+import { applyAck, boundGaps, newSubscription, reconcile, unreadCount } from '../../src/protocol/reconcile.ts';
+import type { GapRecord } from '../../src/protocol/types.ts';
 import type { ExportScan, SubscriptionState } from '../../src/protocol/types.ts';
 import { ServerModel } from '../harness/model.ts';
 
@@ -140,6 +141,52 @@ describe('reconcile', () => {
     expect(r.recreated).toBeUndefined();
     expect(r.delivered.map((x) => x.seq)).toEqual([1]);
     expect(r.next.generation).toBe(1);
+  });
+
+  it('an origin reset (confirmed lower generation) restarts the cursors; unconfirmed it is ignored', () => {
+    const m = new ServerModel();
+    for (let i = 1; i <= 10; i++) m.post('r', 'x', `fresh ${i}`); // generation 1 on the reset origin
+    const stored = sub('r', { generation: 3, headSeq: 5, notifiedSeq: 5, acceptedSeq: 2 });
+    const view = m.read('r', 5, 200);
+    expect(reconcile(stored, 5, view, now).ignored).toBe('stale-generation');
+    const need = reconcile(stored, 5, view, now, { originReset: true });
+    expect(need.needsBackfill).toMatchObject({ reason: 'generation-change', afterSeq: 0, beforeSeq: 6 });
+    const r = reconcile(stored, 5, view, now, { originReset: true, backfill: scan(m, 'r', 0, 6) });
+    expect(r).toMatchObject({ originReset: true, recreated: { from: 3, to: 1 }, regression: { fromHead: 5, toLast: 10 } });
+    expect(r.delivered.map((x) => x.seq)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    expect(r.gaps).toEqual([{ from: 3, to: 5, reason: 'seq-regression', generation: 3, detectedAt: now.toISOString() }]);
+    expect(r.next).toMatchObject({ generation: 1, headSeq: 10, notifiedSeq: 0, acceptedSeq: 0 });
+    // Reset to an origin that holds nothing for the room: cursors restart unsettled.
+    const empty = new ServerModel().read('r', 5, 200);
+    const e = reconcile(stored, 5, empty, now, { originReset: true, backfill: { records: [], bounded: false, afterSeq: 0, beforeSeq: 6, generation: 0 } });
+    expect(e.next).toMatchObject({ generation: 0, headSeq: 0, acceptedSeq: 0, headUnsettled: true });
+    expect(e).toMatchObject({ originReset: true, regression: { fromHead: 5, toLast: 0 } });
+  });
+
+  it('boundGaps never widens a gap over delivered or retained seqs, and never relabels one', () => {
+    const at = now.toISOString();
+    const gap = (from: number, to: number, reason: GapRecord['reason']): GapRecord => ({ from, to, reason, generation: 1, detectedAt: at });
+    // An old ring drop, then backfill-bounded gaps from repeated large backlogs (11..19 were delivered between).
+    const gaps = [gap(1, 10, 'ring-dropped'), gap(20, 30, 'backfill-bounded'), ...Array.from({ length: 7 }, (_, i) => gap(100 + i * 20, 105 + i * 20, 'backfill-bounded'))];
+    const bounded = boundGaps(gaps, { acceptedSeq: 0, generation: 1 }, 8);
+    expect(bounded).toHaveLength(8);
+    for (const g of bounded) {
+      const original = gaps.find((o) => o.from <= g.from && g.to <= o.to);
+      expect(original, `gap ${g.from}..${g.to} ${g.reason} is not inside one recorded gap`).toBeDefined();
+      expect(g.reason).toBe(original!.reason);
+    }
+    // The backfill-bounded record (still retained) is dropped before the ring drop.
+    expect(bounded[0]).toMatchObject({ from: 1, to: 10, reason: 'ring-dropped' });
+    expect(bounded.some((g) => g.from === 20)).toBe(false);
+    // Touching or overlapping gaps of the same reason coalesce; different reasons stay apart.
+    expect(boundGaps([gap(1, 4, 'ring-dropped'), gap(5, 9, 'ring-dropped'), gap(10, 12, 'backfill-bounded')], { acceptedSeq: 0, generation: 1 }, 8)).toEqual([
+      gap(1, 9, 'ring-dropped'),
+      gap(10, 12, 'backfill-bounded'),
+    ]);
+    // unread never under-counts because of bounding.
+    const s = sub('r', { generation: 1, headSeq: 250, gaps: bounded });
+    const exact = sub('r', { generation: 1, headSeq: 250, gaps });
+    expect(unreadCount(s)).toBeGreaterThanOrEqual(unreadCount(exact));
   });
 
   it('ack is monotonic within a generation and clamped to head', () => {

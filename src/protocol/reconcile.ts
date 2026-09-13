@@ -39,11 +39,25 @@ export interface ReconcileResult {
   recreated?: { from?: number; to: number };
   regression?: { fromHead: number; toLast: number };
   ignored?: 'room-mismatch' | 'stale-generation';
+  /**
+   * Set when a `headUnsettled` subscription settled its start: seqs <= settledStart predate the
+   * subscription (neither delivered nor gapped) and the cursors were raised to it.
+   */
+  settledStart?: number;
+  /** The confirmed-lower generation was applied as a restart (see ReconcileOptions.originReset). */
+  originReset?: boolean;
 }
 
 export interface ReconcileOptions {
   backfill?: ExportScan;
   maxGaps?: number;
+  /**
+   * The caller confirmed with fresh, cache-busted reads that the origin now reports a LOWER
+   * generation than the stored one (its data root was reset or restored). The observation is
+   * then applied as a restart (recreated + regression, cursors reset) instead of being ignored
+   * as a stale response.
+   */
+  originReset?: boolean;
 }
 
 function cloneSub(sub: SubscriptionState): SubscriptionState {
@@ -119,27 +133,55 @@ function assemble(
   return { delivered, gaps, head: expected - 1 };
 }
 
-/** Keep gaps bounded: drop settled ones (below acceptedSeq, or older generations), then merge oldest. */
+/**
+ * Keep gaps bounded without ever widening a gap over seqs that were delivered or are still
+ * retained: drop settled records (at or below acceptedSeq; older generations beyond the newest
+ * two), coalesce records that touch or overlap AND share reason and generation, then drop whole
+ * records while over the bound — older generations first (informational only), then the oldest
+ * `backfill-bounded` record (its seqs are still retained and readPage fetches them anyway), then
+ * the oldest record. A dropped `ring-dropped` record only makes `unread` over-count until
+ * readPage re-detects the hole; nothing is ever reported lost that was not.
+ */
 export function boundGaps(gaps: GapRecord[], sub: Pick<SubscriptionState, 'acceptedSeq' | 'generation'>, max = DEFAULT_MAX_GAPS): GapRecord[] {
-  let out = gaps.filter((g) => {
-    const sameGen = g.generation === undefined || sub.generation === undefined || g.generation === sub.generation;
-    return !sameGen || g.to > sub.acceptedSeq;
-  });
-  // Older-generation records are informational only; keep at most two of them.
-  const current = out.filter((g) => g.generation === undefined || sub.generation === undefined || g.generation === sub.generation);
-  const older = out.filter((g) => !current.includes(g)).slice(-2);
-  out = [...older, ...current.sort((a, b) => a.from - b.from)];
-  while (out.length > max) {
-    const [a, b] = out;
-    if (!a || !b) break;
-    if (a.generation !== b.generation) {
-      out.shift();
-      continue;
+  const isCurrent = (g: GapRecord) => g.generation === undefined || sub.generation === undefined || g.generation === sub.generation;
+  const live = gaps.filter((g) => !isCurrent(g) || g.to > sub.acceptedSeq);
+  const older = live.filter((g) => !isCurrent(g)).slice(-2).map((g) => ({ ...g }));
+  const current = live
+    .filter(isCurrent)
+    .map((g) => ({ ...g }))
+    .sort((a, b) => a.from - b.from || a.to - b.to);
+  const merged: GapRecord[] = [];
+  for (const g of current) {
+    const last = merged[merged.length - 1];
+    if (last && last.reason === g.reason && last.generation === g.generation && g.from <= last.to + 1) {
+      last.to = Math.max(last.to, g.to);
+    } else {
+      merged.push(g);
     }
-    const merged: GapRecord = { ...a, from: Math.min(a.from, b.from), to: Math.max(a.to, b.to) };
-    out.splice(0, 2, merged);
+  }
+  const out = [...older, ...merged];
+  while (out.length > Math.max(0, max)) {
+    let i = out.findIndex((g) => !isCurrent(g));
+    if (i < 0) i = out.findIndex((g) => g.reason === 'backfill-bounded');
+    if (i < 0) i = 0;
+    out.splice(i, 1);
   }
   return out;
+}
+
+/** Cursors restart at 0; the old generation's unread range is recorded as a seq-regression gap. */
+function lostOnRestart(sub: SubscriptionState, G: number | undefined, detectedAt: string): GapRecord[] {
+  if (sub.acceptedSeq >= sub.headSeq) return [];
+  const r: GapRecord = { from: sub.acceptedSeq + 1, to: sub.headSeq, reason: 'seq-regression', detectedAt };
+  if (G !== undefined) r.generation = G;
+  return [r];
+}
+
+/** A `headUnsettled` subscription's first records settle its start: seqs <= base predate it. */
+function settleStart(next: SubscriptionState, base: number): void {
+  next.notifiedSeq = Math.max(next.notifiedSeq, base);
+  next.acceptedSeq = Math.max(next.acceptedSeq, base);
+  delete next.headUnsettled;
 }
 
 export function reconcile(
@@ -162,11 +204,15 @@ export function reconcile(
   // Generation 0 means "never existed" (store.room_generation): its first creation is not a recreation.
   const G = sub.generation === 0 ? undefined : sub.generation;
   const g = view.generation;
-  if (g !== undefined && G !== undefined && g < G) return unchanged({ ignored: 'stale-generation' });
+  // A lower generation is normally a stale or replayed response. Only a caller that confirmed it
+  // with fresh reads (the origin's data root was reset or restored) may pass originReset.
+  const backwards = g !== undefined && G !== undefined && g < G;
+  if (backwards && !opts.originReset) return unchanged({ ignored: 'stale-generation' });
   const H = sub.headSeq;
   const start = coverStart(since, view);
   const bf = opts.backfill;
-  const genChanged = g !== undefined && G !== undefined && g > G;
+  const genChanged = g !== undefined && G !== undefined && g !== G;
+  const unsettled = sub.headUnsettled === true;
 
   if (!genChanged) {
     if (since > H) {
@@ -187,14 +233,20 @@ export function reconcile(
       usedBf = bf;
       records = mergeAscending(bf.records.filter((m) => m.seq > H && m.seq < start), fresh);
     }
+    // An unsettled 'now' start: the oldest record readable above H is the first one posted
+    // after the subscription, so nothing below it was lost while watching.
+    const base = unsettled && records[0] ? Math.max(H, records[0].seq - 1) : H;
     const genForGaps = g ?? G;
-    const a = assemble(H, records, usedBf, start, genForGaps, detectedAt);
+    const a = assemble(base, records, usedBf, start, genForGaps, detectedAt);
     const next = cloneSub(sub);
     if (genForGaps !== undefined) next.generation = genForGaps;
     next.headSeq = a.head;
     next.lastActivityAt = detectedAt;
+    if (unsettled) settleStart(next, base);
     next.gaps = boundGaps([...next.gaps, ...a.gaps], next, maxGaps);
-    return finish(next, a, H);
+    const res = finish(next, a, base);
+    if (unsettled) res.settledStart = base;
+    return res;
   }
 
   // Generation changed: the room was (re)created. Only the oldest retained record of the new
@@ -209,40 +261,52 @@ export function reconcile(
   if (oldest === undefined) {
     const next = cloneSub(sub);
     next.generation = g;
-    return { next, delivered: [], gaps: [], recreated };
+    if (!backwards) return { next, delivered: [], gaps: [], recreated };
+    // The reset origin holds nothing for this room yet: restart the cursors and let the first
+    // records it serves settle the start (its floor is unknowable from an empty view).
+    const lost = lostOnRestart(sub, G, detectedAt);
+    next.headSeq = 0;
+    next.notifiedSeq = 0;
+    next.acceptedSeq = 0;
+    next.headUnsettled = true;
+    next.lastActivityAt = detectedAt;
+    next.gaps = boundGaps([...next.gaps, ...lost], next, maxGaps);
+    return { next, delivered: [], gaps: lost, recreated, regression: { fromHead: H, toLast: 0 }, originReset: true };
   }
-  if (oldest <= H) {
-    // Seq regression: the new generation restarted numbering at or below our head.
-    const lost: GapRecord[] = [];
-    if (sub.acceptedSeq < H) {
-      const r: GapRecord = { from: sub.acceptedSeq + 1, to: H, reason: 'seq-regression', detectedAt };
-      if (G !== undefined) r.generation = G;
-      lost.push(r);
-    }
+  if (oldest <= H || backwards) {
+    // Seq regression: the new generation restarted numbering at or below our head — or the
+    // origin itself was reset, where no numbering carries over whatever the seqs look like.
+    const lost = lostOnRestart(sub, G, detectedAt);
     const a = assemble(0, all, bf, start, g, detectedAt);
     const next = cloneSub(sub);
     next.generation = g;
     next.headSeq = a.head;
     next.notifiedSeq = 0;
     next.acceptedSeq = 0;
+    delete next.headUnsettled;
     next.lastActivityAt = detectedAt;
     next.gaps = boundGaps([...next.gaps, ...lost, ...a.gaps], next, maxGaps);
     const res = finish(next, a, 0);
     res.gaps = [...lost, ...a.gaps];
     res.recreated = recreated;
     res.regression = { fromHead: H, toLast: a.head };
+    if (backwards) res.originReset = true;
     return res;
   }
   // Continued sequence: cursors stay (min(current, oldest - 1) == current); anything between
-  // our head and the new generation's oldest record is gone.
-  const a = assemble(H, all.filter((m) => m.seq > H), bf, start, g, detectedAt);
+  // our head and the new generation's oldest record is gone — unless the start is unsettled,
+  // in which case everything below the oldest record predates the subscription.
+  const base = unsettled ? Math.max(H, oldest - 1) : H;
+  const a = assemble(base, all.filter((m) => m.seq > base), bf, start, g, detectedAt);
   const next = cloneSub(sub);
   next.generation = g;
   next.headSeq = a.head;
   if (a.delivered.length || a.gaps.length) next.lastActivityAt = detectedAt;
+  if (unsettled) settleStart(next, base);
   next.gaps = boundGaps([...next.gaps, ...a.gaps], next, maxGaps);
-  const res = finish(next, a, H);
+  const res = finish(next, a, base);
   res.recreated = recreated;
+  if (unsettled) res.settledStart = base;
   return res;
 }
 
@@ -274,15 +338,32 @@ export function applyNotified(sub: SubscriptionState, throughSeq: number, genera
   return { ...cloneSub(sub), notifiedSeq: target };
 }
 
+/** Distinct seqs in [from, to] covered by gaps of `generation` (overlapping records count once). */
+export function gappedCount(gaps: readonly GapRecord[], generation: number | undefined, from: number, to: number): number {
+  const ranges = gaps
+    .filter((g) => g.generation === undefined || generation === undefined || g.generation === generation)
+    .map((g) => [Math.max(g.from, from), Math.min(g.to, to)] as const)
+    .filter(([a, b]) => b >= a)
+    .sort((x, y) => x[0] - y[0]);
+  let total = 0;
+  let curFrom = 0;
+  let curTo = -1;
+  for (const [a, b] of ranges) {
+    if (a > curTo + 1 || curTo < curFrom) {
+      if (curTo >= curFrom) total += curTo - curFrom + 1;
+      curFrom = a;
+      curTo = b;
+    } else {
+      curTo = Math.max(curTo, b);
+    }
+  }
+  if (curTo >= curFrom) total += curTo - curFrom + 1;
+  return total;
+}
+
 /** Seqs in (acceptedSeq, headSeq] not covered by a current-generation gap. */
 export function unreadCount(sub: SubscriptionState): number {
-  let gapped = 0;
-  for (const g of sub.gaps) {
-    if (g.generation !== undefined && sub.generation !== undefined && g.generation !== sub.generation) continue;
-    const from = Math.max(g.from, sub.acceptedSeq + 1);
-    const to = Math.min(g.to, sub.headSeq);
-    if (to >= from) gapped += to - from + 1;
-  }
+  const gapped = gappedCount(sub.gaps, sub.generation, sub.acceptedSeq + 1, sub.headSeq);
   return Math.max(0, sub.headSeq - sub.acceptedSeq - gapped);
 }
 
