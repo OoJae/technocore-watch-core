@@ -422,12 +422,12 @@ class WatcherImpl implements Watcher {
 
   markError(room: string, kind: string): void {
     const at = this.nowIso();
-    void this.mutate((s) => {
+    this.mutate((s) => {
       const cur = s.subscriptions[room];
       if (!cur) return;
       cur.status = 'error';
       cur.lastError = { kind, at };
-    }, 'now');
+    }, 'now').catch((e: unknown) => this.emitEvent({ type: 'error', at, room, detail: { message: String((e as Error)?.message ?? e).slice(0, 200) } }));
     this.emitEvent({ type: 'refused', at, room, detail: { kind } });
   }
 

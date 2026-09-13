@@ -129,6 +129,19 @@ describe('reconcile', () => {
     expect(r.needsBackfill).toMatchObject({ reason: 'catch-up', afterSeq: 2, beforeSeq: 6 });
   });
 
+  it('the first creation of a room that never existed (generation 0) is not reported as a recreation', () => {
+    const m = new ServerModel();
+    const empty = m.read('fresh', 0, 200);
+    expect(empty.generation).toBe(0);
+    const s = reconcile(sub('fresh'), 0, empty, now).next;
+    expect(s.generation).toBe(0);
+    m.post('fresh', 'a', 'first');
+    const r = step(s, m, 'fresh', 0, 200);
+    expect(r.recreated).toBeUndefined();
+    expect(r.delivered.map((x) => x.seq)).toEqual([1]);
+    expect(r.next.generation).toBe(1);
+  });
+
   it('ack is monotonic within a generation and clamped to head', () => {
     const s = sub('r', { generation: 2, headSeq: 10 });
     const a = applyAck(s, 7);

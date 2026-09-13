@@ -28,10 +28,6 @@ export interface HostPoolOptions {
   originConfig?: Partial<OriginConfig>;
 }
 
-function anySignal(signals: AbortSignal[]): AbortSignal {
-  return AbortSignal.any(signals);
-}
-
 function raceAbort<T>(p: Promise<T>, signal: AbortSignal): Promise<T> {
   if (signal.aborted) return Promise.reject(new AbortError());
   return new Promise<T>((resolve, reject) => {
@@ -250,10 +246,14 @@ export class HostPool {
     }, signal);
   }
 
-  /** The long-poll: one of at most maxConcurrentLongPolls per origin. */
+  /**
+   * The long-poll: one of at most maxConcurrentLongPolls per origin. `signal` must already
+   * follow the pool (RoomPoller passes its own controller, which dispose() aborts), so no
+   * composite signal is built per request.
+   */
   async longPoll(room: string, since: number, signal: AbortSignal): Promise<ReadRoomResult> {
     await this.ensureConfig();
-    const sig = anySignal([this.ctrl.signal, signal]);
+    const sig = this.ctrl.signal.aborted ? this.ctrl.signal : signal;
     const slot = await this.longPolls.acquire(sig);
     try {
       await this.governor.acquire(sig);
@@ -371,7 +371,7 @@ export class RoomPoller {
   }
 
   private get signal(): AbortSignal {
-    return anySignal([this.ctrl.signal, this.pool.signal]);
+    return this.ctrl.signal; // HostPool.dispose() stops (aborts) every poller
   }
 
   /** Sleep that a wake() interrupts; only a stop/dispose rejects. */
@@ -383,7 +383,7 @@ export class RoomPoller {
     const w = new AbortController();
     this.wakeCtrl = w;
     try {
-      await sleep(ms, anySignal([this.ctrl.signal, this.pool.signal, w.signal]), this.pool.clock);
+      await sleep(ms, [this.ctrl.signal, this.pool.signal, w.signal], this.pool.clock);
     } catch (e) {
       if (this.ctrl.signal.aborted || this.pool.signal.aborted) throw e;
     } finally {

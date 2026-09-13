@@ -31,20 +31,27 @@ export function throwIfAborted(signal?: AbortSignal): void {
 }
 
 /** Sleep `ms`, rejecting with AbortError as soon as `signal` aborts. Abort beats every sleep. */
-export function sleep(ms: number, signal?: AbortSignal, clock: Clock = systemClock): Promise<void> {
+export function sleep(ms: number, signal?: AbortSignal | readonly AbortSignal[], clock: Clock = systemClock): Promise<void> {
+  // Several signals are watched directly rather than through AbortSignal.any, so a loop that
+  // sleeps millions of times never builds up dependent signals on a long-lived parent.
+  const signals: readonly AbortSignal[] = signal === undefined ? [] : Array.isArray(signal) ? signal : [signal as AbortSignal];
   return new Promise<void>((resolve, reject) => {
-    if (signal?.aborted) {
+    if (signals.some((s) => s.aborted)) {
       reject(new AbortError());
       return;
     }
+    const detach = () => {
+      for (const s of signals) s.removeEventListener('abort', onAbort);
+    };
     const onAbort = () => {
       clock.clearTimeout(handle);
+      detach();
       reject(new AbortError());
     };
     const handle = clock.setTimeout(() => {
-      signal?.removeEventListener('abort', onAbort);
+      detach();
       resolve();
     }, ms);
-    signal?.addEventListener('abort', onAbort, { once: true });
+    for (const s of signals) s.addEventListener('abort', onAbort, { once: true });
   });
 }

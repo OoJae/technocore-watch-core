@@ -159,7 +159,8 @@ export function reconcile(
   });
 
   if (view.room !== sub.room) return unchanged({ ignored: 'room-mismatch' });
-  const G = sub.generation;
+  // Generation 0 means "never existed" (store.room_generation): its first creation is not a recreation.
+  const G = sub.generation === 0 ? undefined : sub.generation;
   const g = view.generation;
   if (g !== undefined && G !== undefined && g < G) return unchanged({ ignored: 'stale-generation' });
   const H = sub.headSeq;
