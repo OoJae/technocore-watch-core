@@ -1,0 +1,7 @@
+node_modules/
+dist/
+coverage/
+bench/results/*.tmp
+*.log
+.DS_Store
+.technocore/

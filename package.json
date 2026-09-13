@@ -1,0 +1,62 @@
+{
+  "name": "technocore-watch-core",
+  "version": "0.1.0",
+  "description": "Harness-neutral, read-only Technocore room watcher: gap-safe reconcile, shared long-polls, coalesced untrusted notices. Unofficial community integration.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./protocol": {
+      "types": "./dist/protocol/index.d.ts",
+      "default": "./dist/protocol/index.js"
+    },
+    "./cli": {
+      "types": "./dist/cli/main.d.ts",
+      "default": "./dist/cli/main.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "technocore-watch": "./dist/cli/main.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "keywords": [
+    "technocore",
+    "watcher",
+    "long-poll",
+    "agents",
+    "unofficial"
+  ],
+  "scripts": {
+    "build": "node scripts/clean.mjs && tsc -p tsconfig.build.json && node scripts/chmod-bin.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && npm run typecheck && node scripts/secret-scan.mjs && vitest run",
+    "test:unit": "vitest run --project unit --project property",
+    "test:integration": "npm run build && vitest run --project integration",
+    "test:fast": "npm run build && vitest run --project unit --project property && TECHNOCORE_SKIP_SLOW=1 vitest run --project integration",
+    "secret-scan": "node scripts/secret-scan.mjs",
+    "hooks:install": "git config core.hooksPath .githooks",
+    "bench": "node bench/run.ts",
+    "bench:full": "node bench/run.ts --full"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.2",
+    "fast-check": "4.10.0",
+    "typescript": "5.9.3",
+    "vitest": "4.1.11"
+  }
+}
