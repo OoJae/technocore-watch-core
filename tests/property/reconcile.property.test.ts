@@ -263,14 +263,14 @@ describe('reconcile properties', () => {
   it('every seq is delivered or gapped, exactly once, across random interleavings (with regressions)', () => {
     fc.assert(
       fc.property(fc.array(opArb(true), { minLength: 1, maxLength: 60 }), (ops) => runScenario(ops, { checkNotices: false })),
-      { numRuns: 400 },
+      { numRuns: Number(process.env.FC_NUM_RUNS ?? 400) },
     );
   });
 
   it('notice counts equal delivered and gapped totals (no regressions)', () => {
     fc.assert(
       fc.property(fc.array(opArb(false), { minLength: 1, maxLength: 60 }), (ops) => runScenario(ops, { checkNotices: true })),
-      { numRuns: 300 },
+      { numRuns: Number(process.env.FC_NUM_RUNS ?? 300) },
     );
   });
 });
