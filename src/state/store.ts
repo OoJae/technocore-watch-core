@@ -5,10 +5,15 @@ export interface LockInfo {
   startedAt: string;
   heartbeatAt: string;
   owner?: string;
+  hostname?: string;
 }
 
 export interface StoreLock {
   readonly info: LockInfo;
+  /** False once released, or once another process took the lock over. */
+  isHeld?(): boolean;
+  /** Called once if another process takes the lock over; the holder must stop polling. */
+  onLost?(fn: () => void): () => void;
   release(): Promise<void>;
 }
 

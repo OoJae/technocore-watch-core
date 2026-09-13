@@ -47,9 +47,13 @@ export class MemoryStateStore implements StateStore {
     this.locks.add(name);
     const now = new Date().toISOString();
     const info: LockInfo = { pid: process.pid, startedAt: now, heartbeatAt: now };
+    let released = false;
     return {
       info,
+      isHeld: () => !released,
+      onLost: () => () => undefined, // nothing else can take an in-memory lock
       release: async () => {
+        released = true;
         this.locks.delete(name);
       },
     };

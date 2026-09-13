@@ -1,6 +1,7 @@
 // Scenarios 10 (two scopes in one pool), 11 (restart: no re-notify) and 12 (dispose leaves no
 // active handles and the proxy sees the connection closed).
 import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -94,7 +95,8 @@ describe('scopes, restart and dispose', () => {
   });
 
   it('scenario 12: dispose leaves no timers or sockets (the process exits by itself) and the proxy sees the close', async () => {
-    const child = spawn(process.execPath, [join(here, '..', 'harness', 'dispose-child.ts'), proxy.origin, join(data.path, 'child')], {
+    if (!existsSync(join(here, '..', '..', 'dist', 'index.js'))) throw new Error('dist/ missing: run `npm run build` (npm test does this)');
+    const child = spawn(process.execPath, [join(here, '..', 'harness', 'dispose-child.mjs'), proxy.origin, join(data.path, 'child')], {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     let out = '';

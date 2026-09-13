@@ -1,5 +1,6 @@
+import { spawn } from 'node:child_process';
 import { mkdtemp, readFile, readdir, rm, writeFile, stat } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { FileStateStore, scopeHash } from '../../src/state/file-store.ts';
@@ -85,6 +86,58 @@ describe('FileStateStore specifics', () => {
     await new Promise((r) => setTimeout(r, 180)); // heartbeats keep it fresh
     expect(await other.acquireLock()).toBeNull();
     await stolen!.release();
+  });
+
+  it('never steals a live holder\'s lock just because its heartbeat is old (laptop asleep)', async () => {
+    const lockPath = join(dir, 'v1', 'poller.lock');
+    // This process holds it; its heartbeat is aged by 60 s as if the machine had slept.
+    const daemon = new FileStateStore(dir); // default 10 s heartbeat: nothing refreshes it during the test
+    const held = await daemon.acquireLock();
+    expect(held).not.toBeNull();
+    const info = JSON.parse(await readFile(lockPath, 'utf8'));
+    await writeFile(lockPath, JSON.stringify({ ...info, heartbeatAt: new Date(Date.now() - 60_000).toISOString() }));
+    const monitor = new FileStateStore(dir, { heartbeatMs: 50 });
+    expect(await monitor.acquireLock()).toBeNull();
+    expect(held!.isHeld!()).toBe(true);
+    await held!.release();
+
+    // Another live process on this host with a stale heartbeat: still not stale...
+    const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'ignore' });
+    try {
+      await new Promise((r) => setTimeout(r, 1500));
+      const quick = new FileStateStore(dir, { heartbeatMs: 50, staleAfterMs: 200 });
+      const other = { pid: child.pid, startedAt: new Date().toISOString(), owner: 'other-process', hostname: hostname() };
+      await writeFile(lockPath, JSON.stringify({ ...other, heartbeatAt: new Date(Date.now() - 500).toISOString() }));
+      expect(await quick.acquireLock()).toBeNull();
+      // ...unless that pid provably started after the last heartbeat (pid reuse).
+      await writeFile(lockPath, JSON.stringify({ ...other, heartbeatAt: new Date(Date.now() - 10_000).toISOString() }));
+      const taken = await quick.acquireLock();
+      expect(taken).not.toBeNull();
+      await taken!.release();
+      // A lock written by a previous process that had our pid is a leftover.
+      await writeFile(lockPath, JSON.stringify({ pid: process.pid, startedAt: 'x', heartbeatAt: new Date().toISOString(), owner: 'previous-life', hostname: hostname() }));
+      const again = await quick.acquireLock();
+      expect(again).not.toBeNull();
+      await again!.release();
+    } finally {
+      child.kill('SIGKILL');
+    }
+  });
+
+  it('a holder whose lock is taken over is told so and never overwrites the new holder', async () => {
+    const store = new FileStateStore(dir, { heartbeatMs: 30 });
+    const lock = (await store.acquireLock())!;
+    let lost = 0;
+    lock.onLost!(() => lost++);
+    const lockPath = join(dir, 'v1', 'poller.lock');
+    const thief = JSON.stringify({ pid: process.pid, startedAt: 'x', heartbeatAt: new Date().toISOString(), owner: 'thief' });
+    await writeFile(lockPath, thief);
+    await new Promise((r) => setTimeout(r, 250));
+    expect(lost).toBe(1);
+    expect(lock.isHeld!()).toBe(false);
+    expect(await readFile(lockPath, 'utf8')).toBe(thief);
+    await lock.release();
+    expect(await readFile(lockPath, 'utf8')).toBe(thief);
   });
 
   it('bounds the notices journal as a ring', async () => {

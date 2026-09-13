@@ -2,6 +2,7 @@
 // parameter, so nothing built on it can write to an origin.
 import * as http from 'node:http';
 import * as https from 'node:https';
+import type { Socket } from 'node:net';
 import { AbortError } from '../limits/clock.ts';
 import type { HeaderLike } from '../protocol/parse.ts';
 
@@ -74,6 +75,12 @@ export class NodeHttpTransport implements Transport {
   private readonly httpAgent: http.Agent;
   private readonly httpsAgent: https.Agent;
   private readonly inflight = new Set<http.ClientRequest>();
+  /**
+   * Every socket this transport used whose 'close' has not fired yet. Tracked by event, not by
+   * `socket.closed`/`destroyed`: those flip as soon as destroy() is called, while the TCP handle
+   * only goes away when 'close' is emitted.
+   */
+  private readonly openSockets = new Set<Socket>();
   private closed = false;
 
   constructor(o: { maxSockets?: number; keepAlive?: boolean } = {}) {
@@ -97,6 +104,11 @@ export class NodeHttpTransport implements Transport {
         headers: { accept: 'application/json, application/x-ndjson;q=0.9, text/plain;q=0.5', ...req.headers },
       });
       this.inflight.add(r);
+      r.on('socket', (sock: Socket) => {
+        if (this.openSockets.has(sock)) return; // a reused keep-alive socket is already tracked
+        this.openSockets.add(sock);
+        sock.once('close', () => this.openSockets.delete(sock));
+      });
       const cleanup = () => {
         if (timer) clearTimeout(timer);
         timer = undefined;
@@ -159,12 +171,40 @@ export class NodeHttpTransport implements Transport {
     });
   }
 
-  close(): void {
+  /**
+   * Destroys every socket (idle keep-alive ones and in-flight requests) and resolves once they
+   * have actually closed: destroy() only schedules the handle close, so resolving earlier would
+   * leave TCP handles alive after a watcher's dispose() resolved. Bounded by closeTimeoutMs.
+   */
+  async close(closeTimeoutMs = 2000): Promise<void> {
     this.closed = true;
+    const sockets = new Set<Socket>(this.openSockets);
+    for (const agent of [this.httpAgent, this.httpsAgent]) {
+      for (const list of [...Object.values(agent.sockets), ...Object.values(agent.freeSockets)]) {
+        for (const s of list ?? []) sockets.add(s);
+      }
+    }
+    for (const r of this.inflight) if (r.socket) sockets.add(r.socket);
+    const closing = [...sockets]
+      .filter((s) => this.openSockets.has(s) || !s.destroyed)
+      .map((s) => new Promise<void>((resolve) => s.once('close', () => resolve())));
+    // A request still waiting for its socket closes once the agent hands it one and it is destroyed.
+    for (const r of this.inflight) if (!r.socket && !r.closed) closing.push(new Promise<void>((resolve) => r.once('close', () => resolve())));
     for (const r of this.inflight) r.destroy(new AbortError('transport closed'));
     this.inflight.clear();
     this.httpAgent.destroy();
     this.httpsAgent.destroy();
+    for (const s of sockets) s.destroy();
+    if (!closing.length) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      Promise.all(closing),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, closeTimeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
   }
 }
 

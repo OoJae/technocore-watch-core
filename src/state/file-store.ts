@@ -4,9 +4,11 @@
 // Every write is tmp file + fsync + rename + directory fsync, under a short-lived per-scope
 // mutex file, with a revision compare-and-set so concurrent processes (a `run` daemon and
 // an `inbox` ack) never lose each other's updates silently.
+import { execFileSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { constants as FS } from 'node:fs';
 import * as fs from 'node:fs/promises';
+import { hostname } from 'node:os';
 import { join } from 'node:path';
 import type { Notice, WatchStateV1 } from '../protocol/types.ts';
 import { MAX_STATE_BYTES, RevisionConflictError, StateError, migrateState } from './model.ts';
@@ -16,6 +18,8 @@ export const MAX_NOTICES_BYTES = 256 << 10;
 const MUTEX_STALE_MS = 10_000;
 const HEARTBEAT_MS = 10_000;
 const LOCK_STALE_MS = 3 * HEARTBEAT_MS;
+/** Same host, pid alive, heartbeat stale, and the pid's start time cannot be read: assume reuse after this. */
+const LIVE_PID_STALE_MS = 15 * 60_000;
 
 export function scopeHash(scopeKey: string): string {
   return createHash('sha256').update(scopeKey, 'utf8').digest('hex').slice(0, 16);
@@ -66,17 +70,63 @@ function pidAlive(pid: number): boolean {
   }
 }
 
+/** Owners of locks held by THIS process (any store instance), to recognise a leftover with our pid. */
+const heldOwners = new Set<string>();
+
+/** When `pid` started (ms), from `ps -o lstart=`; undefined where ps is unavailable (Windows). */
+function pidStartedAt(pid: number): number | undefined {
+  try {
+    const out = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+      encoding: 'utf8',
+      timeout: 2000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+      env: { ...process.env, LC_ALL: 'C', LANG: 'C' },
+    }).trim();
+    const t = Date.parse(out.replace(/\s+/g, ' '));
+    return Number.isFinite(t) ? t : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export class FileStateStore implements StateStore {
   readonly dataDir: string;
   readonly root: string;
   private readonly heartbeatMs: number;
   private readonly staleMs: number;
+  private readonly livePidStaleMs: number;
+  private readonly host = hostname();
 
-  constructor(dataDir: string, o: { heartbeatMs?: number; staleAfterMs?: number } = {}) {
+  constructor(dataDir: string, o: { heartbeatMs?: number; staleAfterMs?: number; livePidStaleAfterMs?: number } = {}) {
     this.dataDir = dataDir;
     this.root = join(dataDir, 'v1');
     this.heartbeatMs = o.heartbeatMs ?? HEARTBEAT_MS;
     this.staleMs = o.staleAfterMs ?? Math.max(LOCK_STALE_MS, 3 * this.heartbeatMs);
+    this.livePidStaleMs = Math.max(this.staleMs, o.livePidStaleAfterMs ?? LIVE_PID_STALE_MS);
+  }
+
+  /**
+   * Whether an existing lock may be taken over. A lock held by a LIVE process on this host is
+   * never stale just because its heartbeat is old (a laptop asleep with the lid closed, a
+   * stopped process): only a dead pid, or a pid that provably started after the last heartbeat
+   * (pid reuse), frees it — or, where the start time cannot be read, a heartbeat older than
+   * livePidStaleMs. A lock from another host (a shared data directory) goes stale on heartbeat.
+   */
+  private lockIsStale(existing: LockInfo | null, fileMtimeMs: number | undefined): boolean {
+    const now = Date.now();
+    if (!existing) {
+      // Unparseable: possibly a holder between its O_EXCL create and its first write.
+      return fileMtimeMs === undefined || now - fileMtimeMs > this.staleMs;
+    }
+    const beat = Date.parse(existing.heartbeatAt);
+    const age = Number.isFinite(beat) ? now - beat : Number.POSITIVE_INFINITY;
+    if (existing.hostname !== undefined && existing.hostname !== this.host) return age > this.staleMs;
+    if (existing.pid === process.pid) return !(existing.owner !== undefined && heldOwners.has(existing.owner));
+    if (!pidAlive(existing.pid)) return true;
+    if (age <= this.staleMs) return false;
+    const started = pidStartedAt(existing.pid);
+    if (started !== undefined) return Number.isFinite(beat) && started > beat + 1000;
+    return age > this.livePidStaleMs;
   }
 
   scopeDir(scopeKey: string): string {
@@ -252,7 +302,8 @@ export class FileStateStore implements StateStore {
     const path = join(this.root, `${name}.lock`);
     for (let attempt = 0; attempt < 3; attempt++) {
       const now = new Date().toISOString();
-      const info: LockInfo = { pid: process.pid, startedAt: now, heartbeatAt: now, owner: randomBytes(6).toString('hex') };
+      const info: LockInfo = { pid: process.pid, startedAt: now, heartbeatAt: now, owner: randomBytes(6).toString('hex'), hostname: this.host };
+      heldOwners.add(info.owner!); // before the file exists, so no sibling store judges it a leftover
       try {
         const h = await fs.open(path, FS.O_WRONLY | FS.O_CREAT | FS.O_EXCL, 0o600);
         try {
@@ -263,23 +314,25 @@ export class FileStateStore implements StateStore {
         }
         return this.heldLock(path, info);
       } catch (e) {
+        heldOwners.delete(info.owner!);
         if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
       }
       let existingText: string;
+      let mtimeMs: number | undefined;
       try {
         existingText = await fs.readFile(path, 'utf8');
+        mtimeMs = (await fs.stat(path)).mtimeMs;
       } catch {
         continue; // released between our open and read
       }
       let existing: LockInfo | null = null;
       try {
-        existing = JSON.parse(existingText) as LockInfo;
+        const parsed = JSON.parse(existingText) as LockInfo;
+        if (parsed && typeof parsed === 'object' && typeof parsed.pid === 'number') existing = parsed;
       } catch {
         existing = null;
       }
-      const beat = existing ? Date.parse(existing.heartbeatAt) : NaN;
-      const stale = !existing || !Number.isFinite(beat) || Date.now() - beat > this.staleMs || !pidAlive(existing.pid);
-      if (!stale) return null;
+      if (!this.lockIsStale(existing, mtimeMs)) return null;
       // Steal only the exact lock we judged stale.
       try {
         if ((await fs.readFile(path, 'utf8')) === existingText) await fs.rm(path, { force: true });
@@ -292,13 +345,36 @@ export class FileStateStore implements StateStore {
 
   private heldLock(path: string, info: LockInfo): StoreLock {
     let released = false;
+    let lost = false;
+    const lostListeners = new Set<() => void>();
+    const markLost = () => {
+      if (lost || released) return;
+      lost = true;
+      clearInterval(timer);
+      if (info.owner) heldOwners.delete(info.owner);
+      for (const fn of [...lostListeners]) {
+        try {
+          fn();
+        } catch {
+          // a listener never breaks the heartbeat
+        }
+      }
+    };
     const beat = async () => {
-      if (released) return;
+      if (released || lost) return;
+      let cur: LockInfo;
+      try {
+        cur = JSON.parse(await fs.readFile(path, 'utf8')) as LockInfo;
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === 'ENOENT') markLost(); // removed by a process that judged it stale
+        return; // otherwise best effort: try again next beat
+      }
+      if (cur?.owner !== info.owner) {
+        markLost(); // taken over: never overwrite the new holder, and tell ours to stop
+        return;
+      }
       info.heartbeatAt = new Date().toISOString();
       try {
-        const text = await fs.readFile(path, 'utf8');
-        const cur = JSON.parse(text) as LockInfo;
-        if (cur.owner !== info.owner) return; // stolen: do not overwrite
         await atomicWrite(path, JSON.stringify(info), this.root);
       } catch {
         // best effort
@@ -307,10 +383,18 @@ export class FileStateStore implements StateStore {
     const timer = setInterval(() => void beat(), this.heartbeatMs);
     return {
       info,
+      isHeld: () => !released && !lost,
+      onLost: (fn: () => void) => {
+        if (lost) queueMicrotask(fn);
+        else lostListeners.add(fn);
+        return () => lostListeners.delete(fn);
+      },
       release: async () => {
         if (released) return;
         released = true;
         clearInterval(timer);
+        lostListeners.clear();
+        if (info.owner) heldOwners.delete(info.owner);
         try {
           const cur = JSON.parse(await fs.readFile(path, 'utf8')) as LockInfo;
           if (cur.owner === info.owner) await fs.rm(path, { force: true });
