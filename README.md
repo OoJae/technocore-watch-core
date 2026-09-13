@@ -279,6 +279,25 @@ messages, against a local server at production-like settings (`CHAT_WAIT_POLL=0.
 replies, notices and duplicate notified seqs after the restart. Results: `bench/results/`.
 
 <!-- bench-results:start -->
+Full W1 run (`bench/results/2026-09-13-488d6e8-scale1.md`, Apple M5 16 GB, Node 26.0.0, one run):
+
+| Wake latency, post 200 -> notice (ms) | n | p50 | p95 | max |
+|---|---|---|---|---|
+| 8-message burst | 16 | 2020 | 2142 | 2142 |
+| trickle (1 per 45 s) | 19 | 2195 | 17196 | 17196 |
+| single messages after restart | 3 | 3098 | 11196 | 11196 |
+| flood (5 msg/s for 5 min) | 1493 | 15280 | 28779 | 30453 |
+| stage: seen by the poll | 1531 | 247 | 474 | 9194 |
+
+- Origin requests: 963 in 15.9 min; per minute `read-wait` 52.9, `read` 7.5, `/config` 0.06. Idle phase:
+  26.1/min for 5 distinct rooms = 3 long-poll slots x 6/min + 2 swept rooms x 4/min, as designed.
+- 429 responses: 0. `wait_held:false` replies: 7 (around the restart, while the origin still held the
+  previous process's waiters; each led to a sleep, not a re-poll).
+- Notices: 26 (8 after the restart), 572-703 characters; **duplicate notified seqs: 0**; posts never covered
+  by a notice: 0 of 1,523.
+- Flood latency is the coalescer doing its job: `minWakeIntervalMs` (30 s) caps wakes per scope, so a
+  flood produces one notice per 30 s instead of one per message. Burst latency is `quietMs` (2 s) plus the
+  0.5 s server wake. The swept rooms account for the 9.2 s stage maximum (sweep interval 15 s).
 <!-- bench-results:end -->
 
 ## Tested versions
