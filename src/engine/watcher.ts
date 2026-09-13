@@ -455,6 +455,9 @@ class WatcherImpl implements Watcher {
       if (cur.lastError && cur.status === 'active') delete cur.lastError;
     });
     const at = this.nowIso();
+    if (r.range) {
+      this.emitEvent({ type: 'activity', at, room, detail: { from: r.range.from, to: r.range.to, delivered: r.delivered.length, transport: obs.transport, fetchedAt: obs.fetchedAt } });
+    }
     for (const g of r.gaps) this.emitEvent({ type: 'gap', at, room, detail: { ...g } });
     if (r.recreated) this.emitEvent({ type: 'recreated', at, room, detail: { ...r.recreated } });
     if (r.regression) this.emitEvent({ type: 'regression', at, room, detail: { ...r.regression } });

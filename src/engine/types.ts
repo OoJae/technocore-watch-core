@@ -83,6 +83,7 @@ export type WatchEventType =
   | 'protocol-error'
   | 'refused'
   | 'backfill'
+  | 'activity'
   | 'gap'
   | 'recreated'
   | 'regression'
