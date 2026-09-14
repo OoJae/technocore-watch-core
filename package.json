@@ -3,6 +3,15 @@
   "version": "0.1.0",
   "description": "Harness-neutral, read-only Technocore room watcher: gap-safe reconcile, shared long-polls, coalesced untrusted notices. Unofficial community integration.",
   "license": "MIT",
+  "author": "OoJae (https://github.com/OoJae)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OoJae/technocore-watch-core.git"
+  },
+  "homepage": "https://github.com/OoJae/technocore-watch-core#readme",
+  "bugs": {
+    "url": "https://github.com/OoJae/technocore-watch-core/issues"
+  },
   "type": "module",
   "engines": {
     "node": ">=20"

@@ -19,6 +19,37 @@ describe('repository hygiene', () => {
     expect(pkg.type).toBe('module');
   });
 
+  it('package metadata points at the GitHub repo, names the author without an email, and publishes with provenance', () => {
+    const pkg = JSON.parse(read('package.json')) as Record<string, unknown>;
+    expect(pkg.author).toBe('OoJae (https://github.com/OoJae)');
+    expect(pkg.repository).toEqual({ type: 'git', url: 'git+https://github.com/OoJae/technocore-watch-core.git' });
+    expect(pkg.homepage).toBe('https://github.com/OoJae/technocore-watch-core#readme');
+    expect(pkg.bugs).toEqual({ url: 'https://github.com/OoJae/technocore-watch-core/issues' });
+    const publish = read('.github/workflows/publish.yml');
+    expect(publish).toContain('npm publish --provenance --access public');
+    // Trusted publishing needs npm >= 11.5.1: Node 24 plus an explicit npm upgrade.
+    expect(publish).toMatch(/node-version: 24\b/);
+    expect(publish).toContain('npm install -g npm@^11.5.1');
+  });
+
+  it('no tracked or pending file contains an email address', () => {
+    const git = (args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8' }).split('\0').filter(Boolean);
+    const files = [...new Set([...git(['ls-files', '-z']), ...git(['ls-files', '--others', '--exclude-standard', '-z'])])];
+    // Built from parts so this file never matches itself.
+    const email = new RegExp(['[A-Za-z0-9._%+-]+', '@', '[A-Za-z0-9-]+(?:\\.[A-Za-z0-9-]+)*\\.[A-Za-z]{2,}'].join(''), 'g');
+    const hits: string[] = [];
+    for (const f of files) {
+      let text: string;
+      try {
+        text = readFileSync(join(root, f), 'utf8');
+      } catch {
+        continue; // deleted in the working tree
+      }
+      for (const m of text.matchAll(email)) hits.push(`${f}: ${m[0]}`);
+    }
+    expect(hits).toEqual([]);
+  });
+
   it('the secret scanner flags 64-hex strings unless allow-listed', () => {
     const planted = 'ab'.repeat(32); // built at runtime so this file never contains one
     expect(scanText(`seed=${planted}\n`, new Set())).toHaveLength(1);
