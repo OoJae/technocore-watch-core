@@ -49,13 +49,25 @@ First version. Unofficial community integration — not affiliated with or endor
 - Flood re-poll pacing (`limits.floodRepollPacing`, default on; `repollLeadMs` 500, `floodRepollMinMs`
   1,000; CLI `--flood-pacing on|off`, `--repoll-lead-ms`, `--flood-repoll-min-ms`). A room whose every
   subscribing scope already has a notice pending no longer re-polls after each message: it naps until
-  just before the earliest of those notices is due (capped at the long-poll wait) and is woken early by
-  a new subscriber, a slot change, a flushed or dropped notice, unsubscribe or dispose. It does not nap
-  when the due time is still being pushed out by `quietMs` and is closer than lead + floor, nor for
-  longer than half a read page takes to fill at the measured rate. Against a local server (integration
-  scenario 13) a 15 s flood at 20 msg/s cost 8 room reads (296 before this change), with no seq lost,
-  and single messages outside the flood were still seen by the poll in under 60 ms. Fake-time unit
-  tests: a 60 s flood at 5 msg/s costs 17 reads instead of 300. New `poll-paced` trace event. `RoomMember` gains `nextNoticeAt()`.
+  `repollLeadMs` before the earliest moment a later read could change one of those notices (the due
+  time of a notice held by `maxDelayMs`/`minWakeIntervalMs`, `quietMs` before the due time of one that
+  activity can still push out), capped at the long-poll wait and at half a read page at the measured
+  rate, then reads live until the flush. It is woken early by a new subscriber, a slot change, a flushed
+  or dropped notice, unsubscribe or dispose. Notices go out at the same times with the same messages as
+  with pacing off. Against a local server (integration scenario 13) a 15 s flood at 20 msg/s cost 67-76
+  room reads (about 300 before this change), with no seq lost, and single messages outside the flood
+  were still seen by the poll in under 40 ms. Fake-time unit test: a 60 s flood at 5 msg/s costs 64
+  reads instead of 300, 44 of them in the first window, which `quietMs` holds open, and 4 in each
+  later window. New `poll-paced` trace event. `RoomMember` gains an optional `pendingNotice()`
+  (`PendingNoticeTiming`: `dueAt`, `movableFrom`).
+- Fixed after review of the pacing change: it napped while `quietMs` still drove the pending notice,
+  and after the lead read it napped `floodRepollMinMs` straight past the flush. A late read moved the
+  notice: uneven traffic (posts at 0/100/2400 ms) got one notice 2.4 s later instead of two, short
+  bursts went out up to 1.45 s later, a burst crossing a `minWakeIntervalMs` due time with
+  `quietMs <= repollLeadMs` was split with its tail a whole window late, and at 50-100 msg/s up to ~1 s
+  of messages before a flush slipped into the next notice. A member without the timing method, or a due
+  time beyond the `Date` range (`toISOString` threw), ended the room's poll loop for good. A coalescer
+  due time beyond 2^31-1 ms armed a timer that fired at once and re-armed in a loop.
 - Pacing limits are validated (`RangeError`/`TypeError` from `HostPool` and `createWatcher`); `limits`
   keys set to `undefined` keep their defaults instead of erasing them. `PACING_BOUNDS` and
   `validateLimits` are exported.

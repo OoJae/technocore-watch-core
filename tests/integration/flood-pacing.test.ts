@@ -1,6 +1,7 @@
 // Scenario 13: flood re-poll pacing against a local technocore-chat. During a flood the room is read a
-// few times per notice window instead of once per message, no seq is lost (a flood, then a fast
-// surge), and a single message outside a flood is still seen by the poll at once.
+// few times per notice window once maxDelayMs/minWakeIntervalMs holds the notice (live while quietMs
+// still drives the first one), no seq is lost (a flood, then a fast surge), and a single message outside
+// a flood is still seen by the poll at once.
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Notice } from '../../src/protocol/types.ts';
 import { startTechnocore, type TechnocoreServer } from '../harness/technocore-server.ts';
@@ -71,8 +72,12 @@ describe('flood re-poll pacing against a local technocore-chat', () => {
     }
 
     // A 15 s flood at 20 msg/s (paced), then a surge of 600 as fast as the server takes them.
+    const noticesBefore = h.notices.length;
     const flood = await floodRoom(room, 300, 20);
     const floodReads = roomReads(room, flood.start, flood.end);
+    // Reads per notice window during the flood: [start, first notice), [first, second), ..., [last, end).
+    const bounds = [flood.start, ...h.notices.slice(noticesBefore).map((n) => Date.parse(n.createdAt)).filter((at) => at < flood.end), flood.end];
+    const perWindow = bounds.slice(1).map((to, i) => roomReads(room, bounds[i]!, to));
     const pacedNaps = h.events.filter((e) => e.type === 'poll-paced').length;
     const surge = await postMany(server.origin, room, 600, (i) => `surge ${i}`, 8);
     const last = surge[surge.length - 1]!;
@@ -100,14 +105,18 @@ describe('flood re-poll pacing against a local technocore-chat', () => {
     expect(h.watcher.status().subscriptions[0]).toMatchObject({ headSeq: after, notifiedSeq: after, acceptedSeq: after, unread: 0, gaps: [] });
 
     console.log(
-      `[scenario 13] flood: ${flood.seqs.length} posts in ${((flood.end - flood.start) / 1000).toFixed(1)} s -> ${floodReads} room reads, ` +
+      `[scenario 13] flood: ${flood.seqs.length} posts in ${((flood.end - flood.start) / 1000).toFixed(1)} s -> ${floodReads} room reads ` +
+        `(per notice window: ${perWindow.join(', ')}), ` +
         `${pacedNaps} paced naps; surge: ${surge.length} posts; notices: ${h.notices.length}; exports: ${proxy.count('export')}; ` +
         `seen-by-poll outside floods (ms): ${singles.join(', ')}`,
     );
     expect(pacedNaps).toBeGreaterThan(0);
-    // 15 s is three 5 s notice windows: a handful of reads each, not one per message.
-    expect(floodReads).toBeLessThanOrEqual(30);
-    expect(floodReads * 5).toBeLessThan(flood.seqs.length);
+    // The first window is held open by quietMs (2 s of live reads) until maxDelayMs caps it. From then on
+    // each 5 s window costs a paced read or two plus live reads in the 500 ms lead before the flush,
+    // instead of about 100 reads (20 msg/s).
+    expect(perWindow.length).toBeGreaterThanOrEqual(3);
+    for (const n of perWindow.slice(1)) expect(n, perWindow.join(', ')).toBeLessThanOrEqual(20);
+    expect(floodReads * 3).toBeLessThan(flood.seqs.length);
     for (const ms of singles) expect(ms).toBeLessThan(1000);
     await h.watcher.dispose();
   });

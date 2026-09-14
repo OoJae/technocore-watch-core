@@ -16,7 +16,18 @@ import {
 import { TransportError, type Transport } from '../transport/http.ts';
 import { MessageCache } from './cache.ts';
 import { SlotScheduler } from './scheduler.ts';
-import { DEFAULT_LIMITS, type Limits, type Observation, type RoomMember, type WatchEvent, type WatchEventType, definedLimits, validateLimits } from './types.ts';
+import {
+  DEFAULT_LIMITS,
+  type Limits,
+  MAX_DATE_MS,
+  type Observation,
+  type PendingNoticeTiming,
+  type RoomMember,
+  type WatchEvent,
+  type WatchEventType,
+  definedLimits,
+  validateLimits,
+} from './types.ts';
 
 export interface HostPoolOptions {
   origin: string;
@@ -193,8 +204,8 @@ export class HostPool {
       this.memberCount--;
       const p = this.polls.get(member.room);
       if (!p) return;
+      // Removing a member only lifts pacing constraints, so a paced nap on this room goes on.
       p.members.delete(member);
-      if (p.members.size > 0) p.reconsiderPacing();
       if (p.members.size === 0) {
         this.polls.delete(member.room);
         this.scheduler.remove(member.room);
@@ -354,6 +365,21 @@ function generationUnsettled(members: readonly RoomMember[], generation: number 
 }
 
 /**
+ * A member's pending-notice timing, or undefined when it has none, does not implement pendingNotice(),
+ * throws, or reports times that are not finite numbers (any of which just means no pacing).
+ */
+function pendingTimingOf(m: RoomMember): PendingNoticeTiming | undefined {
+  let t: PendingNoticeTiming | undefined;
+  try {
+    t = m.pendingNotice?.();
+  } catch {
+    return undefined;
+  }
+  if (!t || !Number.isFinite(t.dueAt) || !Number.isFinite(t.movableFrom)) return undefined;
+  return { dueAt: t.dueAt, movableFrom: Math.min(t.movableFrom, t.dueAt) };
+}
+
+/**
  * A paced nap never lets more than this many messages pile up on the origin at the rate the last
  * response showed: half of the 200-message read page, so the paced re-poll still gets everything in
  * one page instead of a tail window that needs an export backfill.
@@ -428,85 +454,90 @@ export class RoomPoller {
   }
 
   /**
-   * The earliest pending-notice due time over the members this poller serves, or undefined when any of
-   * them has no pending notice (or is still resolving its start, which the loop has to retry).
-   * Paused, errored or disposed members take no observations, so they neither allow nor block pacing.
+   * Until when the next re-poll may wait without changing any member's pending notice, or undefined to
+   * re-poll now: when pacing is off, when any member has no pending notice (or no timing for it), or
+   * while one is still resolving its start (which the loop has to retry). Paused, errored or disposed
+   * members take no observations, so they neither allow nor block pacing. At most the long-poll wait.
+   *
+   * Messages read late are merged exactly as if read on time as long as the read lands before the
+   * notice is due and before activity could still move that (`movableFrom`; the due time itself when
+   * maxDelayMs or minWakeIntervalMs holds it). So the read may wait until `repollLeadMs` before the
+   * earliest such moment, which leaves the lead for the request itself. From there the room is read
+   * live until the flush, exactly as without pacing, and while `quietMs` drives a due time it never
+   * waits at all.
    */
-  private earliestNoticeAt(): number | undefined {
-    let earliest: number | undefined;
+  private pacingUntil(): { until: number; noticeAt: number } | undefined {
+    const l = this.pool.limits;
+    if (!l.floodRepollPacing) return undefined;
+    let settled = Number.POSITIVE_INFINITY;
+    let noticeAt = Number.POSITIVE_INFINITY;
+    let any = false;
     for (const m of this.members) {
       if (m.head() === undefined) return undefined;
       if (!m.active()) continue;
-      const at = m.nextNoticeAt();
-      if (at === undefined || !Number.isFinite(at)) return undefined;
-      earliest = earliest === undefined ? at : Math.min(earliest, at);
+      const t = pendingTimingOf(m);
+      if (!t) return undefined;
+      any = true;
+      settled = Math.min(settled, t.movableFrom);
+      noticeAt = Math.min(noticeAt, t.dueAt);
     }
-    return earliest;
-  }
-
-  /**
-   * How long to pace the next re-poll, or undefined to re-poll now. The nap aims `repollLeadMs` before
-   * the earliest pending notice is due, at least `floodRepollMinMs` and at most the long-poll wait.
-   *
-   * Rounding a short nap up to the floor lets the poll land after that due time. That is harmless when
-   * the due time is `fixed` (maxDelayMs or minWakeIntervalMs holds it where it is whatever arrives): the
-   * flush cuts the nap and the room is read right after it. When the last read moved the due time
-   * later, it is being held open by arriving activity (quietMs), and a poll that lands after it would
-   * let the notice go out early with part of a burst, so there is no nap at all then.
-   */
-  private pacedNapMs(fixed: boolean): { ms: number; noticeAt: number } | undefined {
-    const l = this.pool.limits;
-    if (!l.floodRepollPacing) return undefined;
-    const noticeAt = this.earliestNoticeAt();
-    if (noticeAt === undefined) return undefined;
-    const target = noticeAt - l.repollLeadMs - this.pool.clock.now();
-    if (target < l.floodRepollMinMs && !fixed) return undefined;
-    const ms = Math.min(this.pool.waitSeconds() * 1000, Math.max(l.floodRepollMinMs, target));
-    return { ms, noticeAt };
+    if (!any) return undefined;
+    const now = this.pool.clock.now();
+    const until = settled - l.repollLeadMs;
+    if (!(until > now)) return undefined;
+    return { until: Math.min(until, now + this.pool.waitSeconds() * 1000), noticeAt };
   }
 
   /** Called when members or their pending notices change: cut a paced nap whose reason is gone. */
   reconsiderPacing(): void {
     const p = this.pacing;
     if (!p) return;
-    const next = this.pacedNapMs(true);
-    // Pending notices only move later while they stay pending, so only a notice that went away (or a
-    // member set whose earliest notice is sooner than the nap) needs the poll now.
-    if (!next || this.pool.clock.now() + next.ms < p.until) p.cut.abort();
+    const next = this.pacingUntil();
+    // Pending notices only move later while they stay pending, so only a notice that went away (or one
+    // that needs a read sooner than the nap ends) needs the poll now.
+    if (!next || next.until < p.until) p.cut.abort();
   }
 
   /**
-   * After a poll that returned messages: nap while every member's pending notice absorbs them.
-   * `accrued` messages above the cursor piled up over the `accrualMs` before the response came back at
-   * `respondedAt` (accrualMs is undefined when that span includes idle time, e.g. the first messages
-   * after a quiet long-poll). The nap stays short enough that the next read still fits in one page at
-   * that rate, and is skipped when even the shortest nap would not. Without a rate yet, the first paced
-   * nap is the shortest one, which measures it. `dueBefore` is the earliest pending notice's due time
-   * before this observation: unchanged means it is fixed (see pacedNapMs).
+   * After a poll that returned messages: nap while every member's pending notice absorbs them (see
+   * pacingUntil). `accrued` messages above the cursor piled up over the `accrualMs` before the response
+   * came back at `respondedAt` (accrualMs is undefined when that span includes idle time, e.g. the first
+   * messages after a quiet long-poll). A nap is at least `floodRepollMinMs` (shorter waits are read
+   * live) and short enough that the next read still fits in one page at that rate; it is skipped when
+   * even the shortest nap would not fit. Without a rate yet, a nap is at most `floodRepollMinMs`, which
+   * measures it.
    */
-  private async paceFlood(accrued: number, accrualMs: number | undefined, respondedAt: number, dueBefore: number | undefined): Promise<void> {
-    const dueAfter = this.earliestNoticeAt();
-    const next = this.pacedNapMs(dueBefore !== undefined && dueAfter === dueBefore);
+  private async paceFlood(accrued: number, accrualMs: number | undefined, respondedAt: number): Promise<void> {
+    const next = this.pacingUntil();
     if (!next) return;
     const l = this.pool.limits;
-    let ms: number;
+    const floor = l.floodRepollMinMs;
+    const target = next.until - this.pool.clock.now();
+    if (target < floor) return;
+    let longest: number;
     if (accrualMs === undefined) {
       // No flow measured yet. Messages that woke a long-poll arrived within about one origin
       // wait_poll, so that is the slowest rate they can mean: skip the nap (and measure on the next
       // read) when even that rate would overflow the page target during the shortest nap.
       const wakeSpanMs = Math.max(1, (this.pool.originConfig?.waitPollS ?? 0.5) * 1000);
-      if (accrued * l.floodRepollMinMs > PACED_PAGE_TARGET * wakeSpanMs) return;
-      ms = Math.min(next.ms, l.floodRepollMinMs);
+      if (accrued * floor > PACED_PAGE_TARGET * wakeSpanMs) return;
+      longest = floor;
     } else {
       // Messages also pile up while the observation is processed (an export backfill can take a while).
       const byRate = (PACED_PAGE_TARGET * Math.max(1, accrualMs)) / Math.max(1, accrued) - (this.pool.clock.now() - respondedAt);
-      if (byRate < l.floodRepollMinMs) return;
-      ms = Math.min(next.ms, Math.floor(byRate));
+      if (byRate < floor) return;
+      longest = Math.floor(byRate);
+    }
+    let ms = target;
+    if (longest < target) {
+      // Limited by the rate: end early enough that the rest is still a nap, not a stretch of live reads.
+      ms = target - longest < floor ? Math.max(floor, target - floor) : longest;
     }
     const cut = new AbortController();
     const pacing = { cut, until: this.pool.clock.now() + ms };
     this.pacing = pacing;
-    this.pool.emit({ type: 'poll-paced', room: this.room, detail: { ms, noticeAt: new Date(next.noticeAt).toISOString() } });
+    const noticeAt = Math.abs(next.noticeAt) <= MAX_DATE_MS ? new Date(next.noticeAt).toISOString() : next.noticeAt;
+    this.pool.emit({ type: 'poll-paced', room: this.room, detail: { ms, noticeAt } });
     try {
       await this.nap(ms, cut.signal);
     } finally {
@@ -630,7 +661,6 @@ export class RoomPoller {
         pool.cache.add(room, view.generation, view.messages);
       }
       const obs: Observation = { room, since, view, fetchedAt: result.fetchedAt, transport };
-      const dueBefore = this.earliestNoticeAt();
       const statuses = await Promise.all(
         ready
           .filter((m) => this.members.has(m) && m.active())
@@ -650,7 +680,7 @@ export class RoomPoller {
         // notices that are not due yet; see Limits.floodRepollPacing.
         if (view.messages.length > 0) {
           const accrued = Math.max(view.messages.length, view.last_seq - since);
-          await this.paceFlood(accrued, flowingSince === undefined ? undefined : respondedAt - flowingSince, respondedAt, dueBefore);
+          await this.paceFlood(accrued, flowingSince === undefined ? undefined : respondedAt - flowingSince, respondedAt);
         }
       }
     }

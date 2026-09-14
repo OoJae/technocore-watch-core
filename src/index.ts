@@ -30,6 +30,7 @@ export type {
   WatchEvent,
   WatchEventType,
   RoomMember,
+  PendingNoticeTiming,
   Page,
   WatchStatus,
   SubscriptionStatusView,

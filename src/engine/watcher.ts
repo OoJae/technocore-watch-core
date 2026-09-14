@@ -27,8 +27,10 @@ import {
   DEFAULT_LIMITS,
   type Limits,
   type Logger,
+  MAX_DATE_MS,
   type Observation,
   type Page,
+  type PendingNoticeTiming,
   type RoomMember,
   type SubscriptionStatusView,
   type WatchEvent,
@@ -131,8 +133,8 @@ class SubscriptionMember implements RoomMember {
     return !!s && s.status === 'active' && !s.startFrom && !this.w.disposed;
   }
 
-  nextNoticeAt(): number | undefined {
-    return this.w.nextNoticeAt();
+  pendingNotice(): PendingNoticeTiming | undefined {
+    return this.w.pendingNotice();
   }
 
   prepare(): Promise<boolean> {
@@ -550,10 +552,10 @@ class WatcherImpl implements Watcher {
 
   // ---------------------------------------------------------------- notices & events
 
-  /** When this scope's pending notice is due (epoch ms), or undefined when none is pending. */
-  nextNoticeAt(): number | undefined {
-    if (this.disposed || !this.coalescer.hasPending) return undefined;
-    return this.coalescer.nextFlushAt;
+  /** When this scope's pending notice is due and whether activity can still move that; undefined when none is pending. */
+  pendingNotice(): PendingNoticeTiming | undefined {
+    if (this.disposed) return undefined;
+    return this.coalescer.pendingTiming();
   }
 
   /** The pending notice flushed or lost rooms: let flood-paced pollers of this scope's rooms re-check. */
@@ -751,7 +753,8 @@ class WatcherImpl implements Watcher {
       revision: this.state.revision,
     };
     const next = this.coalescer.nextFlushAt;
-    if (next !== undefined) out.nextWakeAt = new Date(next).toISOString();
+    // A due time beyond the Date range ("effectively never" coalescer timings) has no ISO form.
+    if (next !== undefined && Math.abs(next) <= MAX_DATE_MS) out.nextWakeAt = new Date(next).toISOString();
     return out;
   }
 

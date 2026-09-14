@@ -32,22 +32,30 @@ export interface Limits {
   /**
    * Flood re-poll pacing. After a poll that returned messages, when EVERY subscription following the
    * room already has a pending notice, the room's poller does not re-poll at once: new messages would
-   * only merge into notices that are not due yet. It naps until `repollLeadMs` before the earliest of
-   * those notices is due, at least `floodRepollMinMs` and at most the long-poll wait, so the last poll
-   * lands just before the flush. A wake (new subscriber, slot change), a notice that flushes or is
-   * dropped early, unsubscribe and dispose all cut the nap.
+   * only merge into notices that are not due yet. It naps until `repollLeadMs` before the earliest
+   * moment a later read could change one of those notices, and at most the long-poll wait. For a notice
+   * held by `maxDelayMs` or `minWakeIntervalMs` that moment is its due time; for one arriving activity
+   * can still push out (`quietMs`) it is `quietMs` before its due time, so while `quietMs` drives a
+   * notice there is no nap at all. From `repollLeadMs` before that moment the room is read live again.
+   * As long as a read completes within `repollLeadMs`, notices go out at the same times with the same
+   * messages as without pacing; what changes is when the poll sees messages while a held notice is
+   * pending (`headSeq`/`unread` advance at the paced rate).
    *
-   * A nap never lets a notice go out early on `quietMs` with part of a burst: when the due time is
-   * still being pushed out by arriving activity and is closer than lead + floor, there is no nap. It also never naps so long that, at the rate the last reads showed, more than
-   * half a 200-message read page piles up (which would need an export to fill in). Messages stay on
-   * the origin meanwhile, so nothing is lost; `headSeq`/`unread` just advance at that pace during a
-   * flood, and messages that land inside the lead window go into the next notice. false = re-poll
-   * immediately. Pool-level: read from the HostPool's limits.
+   * A wake (new subscriber, slot change), a notice that flushes or is dropped early, unsubscribe and
+   * dispose all cut the nap. A nap is at least `floodRepollMinMs` (shorter waits are read live) and never
+   * so long that, at the rate the last reads showed, more than half a 200-message read page piles up
+   * (which would need an export to fill in); a flood too fast for even the shortest nap is not paced.
+   * Messages stay on the origin meanwhile, so nothing is lost. false = re-poll immediately. Pool-level:
+   * read from the HostPool's limits.
    */
   floodRepollPacing: boolean;
-  /** How long before the earliest pending notice is due the paced re-poll lands (ms, 0..10000). */
+  /**
+   * How long before a pending notice is due (or could start to move) a paced nap ends and live reads
+   * resume (ms, 0..10000). Must cover a read's round trip: a read that completes later than this can
+   * move messages into the next notice.
+   */
   repollLeadMs: number;
-  /** Shortest paced nap (ms, 100..10000), so a notice that is already due never causes a tight loop. */
+  /** Shortest paced nap (ms, 100..10000); a wait shorter than this is read live. */
   floodRepollMinMs: number;
 }
 
@@ -77,6 +85,9 @@ export const DEFAULT_LIMITS: Limits = {
   repollLeadMs: 500,
   floodRepollMinMs: 1000,
 };
+
+/** Largest epoch ms a Date can hold; toISOString() throws beyond it. */
+export const MAX_DATE_MS = 8.64e15;
 
 /** Bounds for the flood re-poll pacing limits (see Limits). */
 export const PACING_BOUNDS = {
@@ -156,6 +167,18 @@ export interface WatchEvent {
   detail?: Record<string, unknown>;
 }
 
+/** When a pending notice is due, and when newly observed activity could still move that (epoch ms). */
+export interface PendingNoticeTiming {
+  /** When the notice is due. */
+  dueAt: number;
+  /**
+   * Activity first observed after this moment pushes `dueAt` later (quietMs); `dueAt` itself when
+   * nothing can move it any more (maxDelayMs or minWakeIntervalMs holds it). Activity observed up to
+   * this moment leaves the notice's timing where it is.
+   */
+  movableFrom: number;
+}
+
 export interface RoomMember {
   readonly id: string;
   readonly room: string;
@@ -167,11 +190,12 @@ export interface RoomMember {
   generation(): number | undefined;
   active(): boolean;
   /**
-   * Epoch ms at which the notice this member already has pending is due, or undefined when none is
-   * pending. The room's poller paces flood re-polls only while every active member has one; a member
-   * whose pending notice goes away early (flushed, dropped) should get HostPool.noticeChanged(room).
+   * Timing of the notice this member already has pending, or undefined when none is pending. Optional:
+   * the room's poller paces flood re-polls only while every active member reports one (a member without
+   * this method, or one that throws or returns non-finite times, simply never allows pacing). A member
+   * whose pending notice goes away early (flushed, dropped) should call HostPool.noticeChanged(room).
    */
-  nextNoticeAt(): number | undefined;
+  pendingNotice?(): PendingNoticeTiming | undefined;
   onObservation(obs: Observation): Promise<'ok' | 'retry'>;
   onFatal(refusal: Refusal): void;
 }

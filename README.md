@@ -38,6 +38,12 @@ Known gaps (honest list):
   sharply during a nap (say from 20 msg/s to hundreds) can pile up more than a 200-message read page,
   which costs one export to fill in (no loss). Scenario 13's 600-message surge right after a flood does
   exactly that (1 export). `--flood-pacing off` avoids it at one read per message.
+- Pacing only saves reads while a notice is held by `maxDelayMs` or `minWakeIntervalMs`. While `quietMs`
+  still drives a notice (the first `maxDelayMs - quietMs`, 8 s by default, of a flood from an idle room)
+  the room is read live, because a late read would move the notice. Short floods therefore save little,
+  and with `minWakeIntervalMs` below `maxDelayMs` most of each window is read live.
+- Pacing keeps notice times and contents identical only if a read completes within `repollLeadMs`
+  (500 ms). Against a slower origin, raise it.
 - `GET /r/<room>/export` is the only way to recover what a tail read skipped (no `before=` paging
   upstream, see #775), so a backfill can cost up to one ring download (bounded to 12 MiB / 2,000 records
   by default, one export at a time per origin).
@@ -188,19 +194,24 @@ posted after subscribing are neither delivered nor reported as a gap.
 - **Flood re-poll pacing** (`limits.floodRepollPacing`, on by default). A long-poll returns as soon as
   one message arrives, so without pacing a flood costs one read per message, all merged into notices
   that are not due yet. After a read with messages, when *every* scope following the room already has
-  a notice pending, the room's poller naps until `repollLeadMs` (500 ms) before the earliest of those
-  notices is due, at least `floodRepollMinMs` (1 s) and at most the long-poll wait (10 s), so the last
-  read lands just before the flush. A new subscriber, a slot change, a notice that flushes or is dropped
-  early (so some scope has nothing pending), unsubscribe and dispose all end the nap at once; a scope
-  that leaves while another still has a notice pending does not. Guards: no nap when the due time is
-  still being pushed out by arriving activity (`quietMs`) and is closer than lead + floor, so a burst is
-  never split; and no nap long enough for more than 100 messages (half a read page) to pile up at the
-  rate the last reads showed. Messages stay on the origin, so nothing is lost. What changes during a
-  flood: `headSeq`/`unread` advance at the paced rate, messages that land inside the 500 ms lead window
-  go into the next notice, and a flood that speeds up sharply *during* a nap can overflow a page and
-  cost one export. In a 15 s flood at 20 msg/s against a local server (integration scenario 13) the room
-  was read 8 times instead of 296; single messages outside floods are still seen by the poll within tens
-  of milliseconds (that server's `wait_poll` is 50 ms), the same as with pacing off. Set it to `false` (CLI `--flood-pacing off`) to re-poll immediately.
+  a notice pending, the room's poller naps until `repollLeadMs` (500 ms) before the earliest moment a
+  later read could change one of those notices, and at most the long-poll wait (10 s). For a notice
+  held by `maxDelayMs` or `minWakeIntervalMs` that moment is its due time. For one that arriving
+  activity can still push out (`quietMs`), it is `quietMs` before its due time, so while `quietMs`
+  drives a notice there is no nap at all. From the lead point on, the room is read live until the flush.
+  As long as a read completes within the lead, notices go out at the same times with the same messages
+  as with pacing off (fake-time tests compare both on bursts, uneven traffic and floods from 5 to
+  100 msg/s). A new subscriber, a slot change, a notice that flushes or is dropped early (so some scope
+  has nothing pending), unsubscribe and dispose all end the nap at once; a scope that leaves while
+  another still has a notice pending does not. A nap is at least `floodRepollMinMs` (1 s; shorter waits
+  are read live), and never long enough for more than 100 messages (half a read page) to pile up at
+  the rate the last reads showed. Messages stay on the origin, so nothing is lost. What changes while a
+  held notice is pending: the poll sees messages at the paced rate (`headSeq`/`unread` advance in
+  steps), rooms within a multi-room notice are ordered by when each was last read, so that order (and
+  which rooms beyond 16 become `more_rooms`) can differ, and a flood that speeds up sharply *during* a nap can overflow a page and cost one export. In
+  a 15 s flood at 20 msg/s against a local server (integration scenario 13) the room was read 67-76
+  times instead of about 300. The first notice window is read live (44 reads), each later 5 s window
+  11-12 times. Set it to `false` (CLI `--flood-pacing off`) to re-poll immediately.
 - 429: honour the body's `retry after: Ns` (falling back to `Retry-After`), penalize the whole pool's
   bucket, then decorrelated jitter. Network errors and 5xx: decorrelated jitter (500 ms .. 60 s).
   400/403: the subscription goes to `status: 'error'` and stops polling. Abort beats every sleep.
@@ -318,7 +329,7 @@ dependencies (n8n community nodes) can copy it verbatim and pin a hash.
 
 | Project | What |
 |---|---|
-| `unit` | protocol parsing/sweep/render, reconcile examples (incl. origin reset and gap bounding), limits, coalescer and scheduler under fake timers, stores and the poller lock (live holder, pid reuse, takeover detection), read-only transport and its socket-closing `close()`, protocol purity, secret scan (hex and base64 seeds), engine end-to-end on an in-memory origin model under fake time (incl. a recreation whose export fails once, an origin whose generation goes down, `now` on reaped/expired rooms, notice/page/cache bounds, flood re-poll pacing: reads per notice window, wake/flush/unsubscribe/dispose cutting the nap, shared rooms, no split bursts, no lost seqs), the CLI `monitor` follower across journal rewrites and `run` losing its lock |
+| `unit` | protocol parsing/sweep/render, reconcile examples (incl. origin reset and gap bounding), limits, coalescer and scheduler under fake timers, stores and the poller lock (live holder, pid reuse, takeover detection), read-only transport and its socket-closing `close()`, protocol purity, secret scan (hex and base64 seeds), engine end-to-end on an in-memory origin model under fake time (incl. a recreation whose export fails once, an origin whose generation goes down, `now` on reaped/expired rooms, notice/page/cache bounds, flood re-poll pacing: reads per notice window, identical notice times and contents with pacing on and off, wake/flush/unsubscribe/dispose cutting the nap, shared rooms, members still starting, no lost seqs), the CLI `monitor` follower across journal rewrites and `run` losing its lock |
 | `property` | fast-check: delivered-or-gapped invariant, idempotence, monotonic `acceptedSeq`, notice totals, unsettled `now` starts never gapping pre-subscription seqs, `boundGaps` never widening a gap |
 | `integration` | local technocore-chat v0.13.0 per file + counting/fault-injecting proxy: the 13 scenarios below, the CLI, CLI entry-point detection (symlink vs. same-named wrapper), and Python sweep parity |
 
@@ -337,24 +348,25 @@ Integration scenarios (each against the real server):
 11. restart with the same store: no re-notify
 12. dispose: no timers or sockets left the moment `dispose()` resolves (a plain-ESM child running `dist/`
     exits on its own), proxy sees the close
-13. flood re-poll pacing: a 15 s flood at 20 msg/s is read a few times per notice window (and about once
-    per message with pacing off), then a 600-message surge; notices and pages cover every seq once with
-    no gaps, and single messages before and after the flood are seen by the poll in under a second
+13. flood re-poll pacing: a 15 s flood at 20 msg/s is read live while `quietMs` drives the first notice,
+    then a few times per notice window (about once per message with pacing off), then a 600-message
+    surge; notices and pages cover every seq once with no gaps, and single messages before and after the
+    flood are seen by the poll in under a second
 
 Running them needs `uv` and a technocore-chat checkout at v0.13.0 with `uv sync --frozen` done, found at
 `$TECHNOCORE_CHECKOUT` or `../.cache/technocore-chat`. `npm run test:fast` skips the two slow scenarios
 (`TECHNOCORE_SKIP_SLOW=1`); `npm test` runs everything.
 
 <!-- test-results:start -->
-Last full `npm test` after the flood re-poll pacing change (2026-09-14, Apple M5 16 GB, macOS 26, uv 0.11.14,
+Last full `npm test` after the flood re-poll pacing fixes (2026-09-14, Apple M5 16 GB, macOS 26, uv 0.11.14,
 technocore-chat v0.13.0 @20a4457, slow scenarios included): build + typecheck + secret scan OK, then
-**29 test files, 131 tests passed, 0 failed, 0 skipped** — unit 108, property 4, integration 19 — twice on
-**Node 26.0.0** and once on **Node 22.23.2** (integration children included). Node 20 was not re-run for
-this change (no local Node 20 binary; the previous full run on Node 20.20.2 passed before it, and CI
-covers 20/22/24). Scenario 13 in those three runs: the 15 s, 300-message flood cost 8 room reads each
-time (the pacing-off control: 155 and 158 reads for 160 messages; the same scenario on the code before
-this change: 296 reads), 1 export for the surge, no gaps, and single messages were seen by the poll in
-27-51 ms.
+**29 test files, 140 tests passed, 0 failed, 0 skipped** — unit 117, property 4, integration 19 — on
+**Node 26.0.0**. Node 20 and 22 were not re-run for this change (no local binaries; CI covers 20/22/24).
+Scenario 13 in two separate runs of its file: the 15 s, 300-message flood cost 67 and 76 room reads
+(per notice window 44, 12, 11 in the run that printed them; the first window is read live while `quietMs`
+drives it), the pacing-off control 155 reads for 160 messages, 1 export for the surge, no gaps, and
+single messages were seen by the poll in 11-38 ms. The earlier pacing code read the flood 8 times, but it
+moved notices (see CHANGELOG).
 <!-- test-results:end -->
 
 ## Benchmark

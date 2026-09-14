@@ -1,10 +1,11 @@
-// Flood re-poll pacing (Limits.floodRepollPacing) under fake time against the in-memory origin: a
-// flood costs about one lead read per notice window instead of one read per message, wake() and a
-// flushed or dropped notice cut the nap, nothing is lost, and latency outside floods is unchanged.
+// Flood re-poll pacing (Limits.floodRepollPacing) under fake time against the in-memory origin: once a
+// notice is held by maxDelayMs/minWakeIntervalMs a flood costs a few reads per notice window instead of
+// one read per message, wake() and a flushed or dropped notice cut the nap, nothing is lost, and
+// notices go out at the same times with the same messages as without pacing.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { HostPool } from '../../src/engine/host-pool.ts';
 import { createWatcher, type Watcher, type WatcherOptions } from '../../src/engine/watcher.ts';
-import { DEFAULT_LIMITS, validateLimits, type WatchEvent } from '../../src/engine/types.ts';
+import { DEFAULT_COALESCE, DEFAULT_LIMITS, validateLimits, type Observation, type PendingNoticeTiming, type RoomMember, type WatchEvent } from '../../src/engine/types.ts';
 import { MemoryStateStore } from '../../src/state/memory-store.ts';
 import type { Notice } from '../../src/protocol/types.ts';
 import { FakeOrigin } from '../harness/fake-transport.ts';
@@ -78,8 +79,8 @@ beforeEach(() => vi.useFakeTimers({ now: new Date('2026-09-14T00:00:00Z') }));
 afterEach(() => vi.useRealTimers());
 
 describe('flood re-poll pacing (fake time)', () => {
-  it('a 60 s flood at 5 msg/s costs a few reads per notice window, not one per message, and loses nothing', async () => {
-    const results: Record<string, { reads: number; notices: number }> = {};
+  it('a 60 s flood at 5 msg/s costs a few reads per notice window once maxDelayMs holds the notice, and loses nothing', async () => {
+    const results: Record<string, { reads: number; perWindow: number[]; notices: string[] }> = {};
     for (const pacing of [true, false]) {
       const origin = new FakeOrigin();
       const s = scope(origin, { limits: { floodRepollPacing: pacing } });
@@ -87,12 +88,18 @@ describe('flood re-poll pacing (fake time)', () => {
       await vi.advanceTimersByTimeAsync(100);
       const t0 = Date.now();
       await flood(origin, 'flood', 300, 200);
-      const floodReads = reads(origin, 'flood', t0, Date.now());
+      const end = Date.now();
       await vi.advanceTimersByTimeAsync(30_000);
       expectContiguous(s.notices, 'flood', 0, 300);
       expect(s.w.status().subscriptions[0]).toMatchObject({ headSeq: 300, notifiedSeq: 300, gaps: [] });
       expect(origin.counts().export).toBe(0);
-      results[pacing ? 'paced' : 'unpaced'] = { reads: floodReads, notices: s.notices.length };
+      // Reads per notice window: [flood start, first notice), [first notice, second notice), ...
+      const bounds = [t0, ...s.notices.map((n) => Date.parse(n.createdAt)).filter((at) => at < end), end];
+      results[pacing ? 'paced' : 'unpaced'] = {
+        reads: reads(origin, 'flood', t0, end),
+        perWindow: bounds.slice(1).map((to, i) => reads(origin, 'flood', bounds[i]!, to)),
+        notices: s.notices.map((n) => `${n.rooms[0]!.seqFrom}-${n.rooms[0]!.seqTo}@${Date.parse(n.createdAt) - t0}`),
+      };
       await s.w.dispose();
       expect(vi.getTimerCount()).toBe(0);
     }
@@ -100,12 +107,16 @@ describe('flood re-poll pacing (fake time)', () => {
     const unpaced = results.unpaced!;
     // Without pacing every message wakes the long-poll: one read per message.
     expect(unpaced.reads).toBeGreaterThanOrEqual(280);
-    // With it: the first window's quiet-driven reads, then one lead read before each flush and one
-    // right after it (the flush cuts the nap), with 6 windows in 60 s.
-    expect(paced.reads).toBeLessThanOrEqual(2 * paced.notices + 8);
-    expect(paced.reads * 10).toBeLessThan(unpaced.reads);
-    // The same notices either way: pacing changes when the poll lands, not what the scope is told.
-    expect(Math.abs(paced.notices - unpaced.notices)).toBeLessThanOrEqual(1);
+    // The same notices, at the same times: pacing changes when the poll lands, not what the scope is told.
+    expect(paced.notices).toEqual(unpaced.notices);
+    expect(paced.notices).toHaveLength(6);
+    // The first window is held open by quietMs until maxDelayMs caps it, so it is read live (never more
+    // than unpaced). Every later window: a paced read or two, then live reads in the 500 ms lead window.
+    const [first, ...later] = paced.perWindow;
+    expect(first).toBeLessThanOrEqual(unpaced.perWindow[0]!);
+    expect(later).toHaveLength(5);
+    for (const n of later) expect(n, paced.perWindow.join(', ')).toBeLessThanOrEqual(6);
+    expect(paced.reads * 4).toBeLessThan(unpaced.reads);
   });
 
   it('the paced read lands just before the notice is due, so the flush carries fresh data', async () => {
@@ -361,5 +372,324 @@ describe('flood re-poll pacing (fake time)', () => {
     expect(pool.limits).toMatchObject({ floodRepollPacing: true, repollLeadMs: 500, floodRepollMinMs: 2000 });
     expect(validateLimits({ repollLeadMs: 0, floodRepollMinMs: 10_000 })).toEqual({ repollLeadMs: 0, floodRepollMinMs: 10_000 });
     void pool.dispose();
+  });
+});
+
+/** Offsets (ms) for `count` posts, one every `everyMs`, starting at `from`. */
+function every(count: number, everyMs: number, from = 0): number[] {
+  return Array.from({ length: count }, (_, i) => from + i * everyMs);
+}
+
+interface ScheduleRun {
+  /** `seqFrom-seqTo@createdAt` per notice, createdAt relative to the first post slot. */
+  notices: string[];
+  /** `to@at` per activity event (when the poll saw each step), relative to the first post slot. */
+  seen: string[];
+  paced: number;
+}
+
+/** Posts one message at each offset (ms after t0), then lets every notice go out. */
+async function runSchedule(pacing: boolean, coalesce: WatcherOptions['coalesce'], schedule: readonly number[]): Promise<ScheduleRun> {
+  const origin = new FakeOrigin();
+  const s = scope(origin, { coalesce, limits: { floodRepollPacing: pacing } });
+  await s.w.subscribe('r');
+  await vi.advanceTimersByTimeAsync(100);
+  const t0 = Date.now();
+  for (const [i, off] of [...schedule].sort((a, b) => a - b).entries()) {
+    const wait = t0 + off - Date.now();
+    if (wait > 0) await vi.advanceTimersByTimeAsync(wait);
+    origin.model.post('r', 'a', `m${i}`);
+  }
+  await vi.advanceTimersByTimeAsync(90_000);
+  expectContiguous(s.notices, 'r', 0, schedule.length);
+  const run: ScheduleRun = {
+    notices: s.notices.map((n) => `${n.rooms[0]!.seqFrom}-${n.rooms[0]!.seqTo}@${Date.parse(n.createdAt) - t0}`),
+    seen: s.events.filter((e) => e.type === 'activity').map((e) => `${e.detail?.to}@${Date.parse(e.at) - t0}`),
+    paced: s.events.filter((e) => e.type === 'poll-paced').length,
+  };
+  await s.w.dispose();
+  expect(vi.getTimerCount()).toBe(0);
+  return run;
+}
+
+/** A RoomMember driven by the test: head follows what it observes; `timing` is its pending notice. */
+class ScriptedMember implements RoomMember {
+  readonly id: string;
+  readonly room: string;
+  headSeq: number | undefined;
+  gen: number | undefined;
+  prepares = 0;
+  pendingNotice?: () => PendingNoticeTiming | undefined;
+
+  constructor(room: string, head: number | undefined, timing?: (m: ScriptedMember) => PendingNoticeTiming | undefined) {
+    this.room = room;
+    this.id = `scripted#${room}#${Math.random()}`;
+    this.headSeq = head;
+    if (timing) this.pendingNotice = () => timing(this);
+  }
+
+  prepare(): Promise<boolean> {
+    this.prepares++;
+    return Promise.resolve(this.headSeq !== undefined);
+  }
+
+  head(): number | undefined {
+    return this.headSeq;
+  }
+
+  generation(): number | undefined {
+    return this.gen;
+  }
+
+  active(): boolean {
+    return this.headSeq !== undefined;
+  }
+
+  onObservation(obs: Observation): Promise<'ok' | 'retry'> {
+    this.gen = obs.view.generation;
+    const last = obs.view.messages.at(-1)?.seq;
+    if (last !== undefined && this.headSeq !== undefined) this.headSeq = Math.max(this.headSeq, last);
+    return Promise.resolve('ok');
+  }
+
+  onFatal(): void {}
+}
+
+/** A notice due at `dueAt` that no activity can move. */
+function fixedAt(dueAt: number): PendingNoticeTiming {
+  return { dueAt, movableFrom: dueAt };
+}
+
+describe('flood re-poll pacing fidelity (fake time)', () => {
+  it('never changes when notices go out or what they cover while quietMs can still move the due time', async () => {
+    const defaults = { quietMs: 2000, maxDelayMs: 10_000, minWakeIntervalMs: 30_000 };
+    const cases: { name: string; coalesce: WatcherOptions['coalesce']; schedule: number[]; sameSeen?: boolean }[] = [
+      // Uneven traffic outside floods: pacing must not stretch the quiet window or merge notices.
+      { name: 'defaults, posts at 0/100/2400', coalesce: DEFAULT_COALESCE, schedule: [0, 100, 2400], sameSeen: true },
+      // (Posts 4..6 arrive while a notice held by minWakeIntervalMs is pending: those are read at the paced rate.)
+      { name: 'defaults, posts at 0/100/2400/4700/7000/9300', coalesce: DEFAULT_COALESCE, schedule: [0, 100, 2400, 4700, 7000, 9300] },
+      { name: 'defaults, posts at 0/300/600/3000', coalesce: DEFAULT_COALESCE, schedule: [0, 300, 600, 3000], sameSeen: true },
+      // Short bursts from an idle room: the notice must not go out later.
+      { name: '8 posts 150 ms apart', coalesce: { ...defaults }, schedule: every(8, 150), sameSeen: true },
+      { name: '5 posts 300 ms apart', coalesce: { ...defaults }, schedule: every(5, 300), sameSeen: true },
+      { name: '30 posts 200 ms apart', coalesce: { ...defaults }, schedule: every(30, 200), sameSeen: true },
+      { name: '8 posts 400 ms apart', coalesce: { ...defaults }, schedule: every(8, 400), sameSeen: true },
+      // quietMs <= repollLeadMs, and a burst that runs across a due time held by minWakeIntervalMs.
+      ...[5000, 5130, 5270, 5410, 5555, 6000].flatMap((start) => [
+        { name: `quiet 500, burst from ${start} ms across the min-wake due`, coalesce: { quietMs: 500, maxDelayMs: 10_000, minWakeIntervalMs: 10_000 }, schedule: [0, ...every(80, 100, start)] },
+        { name: `quiet 200, burst from ${start} ms across the min-wake due`, coalesce: { quietMs: 200, maxDelayMs: 10_000, minWakeIntervalMs: 10_000 }, schedule: [0, ...every(80, 100, start)] },
+      ]),
+    ];
+    for (const c of cases) {
+      const paced = await runSchedule(true, c.coalesce, c.schedule);
+      const unpaced = await runSchedule(false, c.coalesce, c.schedule);
+      expect(paced.notices, c.name).toEqual(unpaced.notices);
+      if (c.sameSeen) {
+        // No notice held by maxDelayMs/minWakeIntervalMs was pending: the poll sees every message when it would unpaced.
+        expect(paced.seen, c.name).toEqual(unpaced.seen);
+      }
+    }
+  });
+
+  it('a paced read lands at most repollLeadMs before a fixed flush, also when the flood rate limits the naps', async () => {
+    const rates: [everyMs: number, perTick: number][] = [
+      [200, 1], // 5 msg/s: naps are not rate-limited
+      [50, 3], // 60 msg/s
+      [40, 3], // 75 msg/s
+      [50, 4], // 80 msg/s
+      [100, 10], // 100 msg/s
+    ];
+    for (const [everyMs, perTick] of rates) {
+      const origin = new FakeOrigin();
+      const s = scope(origin);
+      await s.w.subscribe('flood');
+      await vi.advanceTimersByTimeAsync(100);
+      const postedAt: number[] = [];
+      for (let t = 0; t < 60_000; t += everyMs) {
+        for (let k = 0; k < perTick; k++) postedAt[origin.model.post('flood', 'flooder', `m${t}.${k}`).seq] = Date.now();
+        await vi.advanceTimersByTimeAsync(everyMs);
+      }
+      const posted = postedAt.length - 1;
+      await vi.advanceTimersByTimeAsync(30_000);
+      expectContiguous(s.notices, 'flood', 0, posted);
+      expect(origin.counts().export).toBe(0);
+      expect(s.events.some((e) => e.type === 'poll-paced'), `${perTick}/${everyMs} ms`).toBe(true);
+      // For each notice: how long before it went out was the oldest message it does not cover posted?
+      const ages = s.notices.map((n) => {
+        const at = Date.parse(n.createdAt);
+        const next = n.rooms[0]!.seqTo + 1;
+        return next <= posted && postedAt[next]! < at ? at - postedAt[next]! : 0;
+      });
+      // repollLeadMs, plus at most the fake origin's wake latency (50 ms) and one posting tick.
+      for (const age of ages) expect(age, `${perTick} every ${everyMs} ms: ${ages.join(', ')}`).toBeLessThanOrEqual(DEFAULT_LIMITS.repollLeadMs + 50 + everyMs);
+      // Waits shorter than floodRepollMinMs are read live, and a nap the rate cuts short leaves the rest
+      // as one more nap rather than a stretch of live reads (80 msg/s: 276 reads; 341 without that).
+      const naps = s.events.filter((e) => e.type === 'poll-paced').map((e) => Number(e.detail?.ms));
+      expect(Math.min(...naps)).toBeGreaterThanOrEqual(DEFAULT_LIMITS.floodRepollMinMs);
+      expect(reads(origin, 'flood'), `${perTick} every ${everyMs} ms`).toBeLessThanOrEqual(290);
+      await s.w.dispose();
+    }
+  });
+
+  it('a wake from before the poll started (slot assignment on attach) does not skip the first paced nap', async () => {
+    const origin = new FakeOrigin();
+    const pool = new HostPool({ origin: ORIGIN, transport: origin });
+    const t0 = Date.now();
+    const polls: number[] = [];
+    const naps: number[] = [];
+    pool.onEvent((e) => {
+      if (e.room !== 'solo') return;
+      if (e.type === 'poll-start') polls.push(Date.now());
+      if (e.type === 'poll-paced') naps.push(Date.now());
+    });
+    const member = new ScriptedMember('solo', 0, (m) => (m.headSeq ? fixedAt(t0 + 60_000) : undefined));
+    const detach = pool.attach(member);
+    await vi.advanceTimersByTimeAsync(100);
+    origin.model.post('solo', 'a', 'one');
+    await until(() => naps.length === 1);
+    const napAt = naps[0]!;
+    origin.model.post('solo', 'a', 'two');
+    await vi.advanceTimersByTimeAsync(900);
+    // The first paced nap (floodRepollMinMs) runs in full: no poll until it ends.
+    expect(polls.filter((t) => t > napAt)).toEqual([]);
+    await vi.advanceTimersByTimeAsync(200);
+    expect(polls.filter((t) => t > napAt)).toHaveLength(1);
+    detach();
+    await pool.dispose();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('no pacing while another member of the room is still resolving its start', async () => {
+    const origin = new FakeOrigin();
+    const pool = new HostPool({ origin: ORIGIN, transport: origin });
+    const events: WatchEvent[] = [];
+    pool.onEvent((e) => events.push(e));
+    const t0 = Date.now();
+    const ready = new ScriptedMember('mixed', 0, (m) => (m.headSeq ? fixedAt(t0 + 120_000) : undefined));
+    // Its start never resolves (prepare() keeps returning false), so it has no head and is not active.
+    const starting = new ScriptedMember('mixed', undefined, () => fixedAt(t0 + 120_000));
+    const offA = pool.attach(ready);
+    const offB = pool.attach(starting);
+    await vi.advanceTimersByTimeAsync(100);
+    const before = starting.prepares;
+    const t1 = Date.now();
+    await flood(origin, 'mixed', 40, 200);
+    expect(ready.headSeq).toBe(40);
+    expect(events.filter((e) => e.type === 'poll-paced')).toEqual([]);
+    // Every pass retries the pending start, so it is not held back by a nap.
+    expect(starting.prepares - before).toBeGreaterThanOrEqual(35);
+    expect(reads(origin, 'mixed', t1, Date.now())).toBeGreaterThanOrEqual(35);
+    offA();
+    offB();
+    await pool.dispose();
+  });
+
+  it('unsubscribing the room that held a scope\'s only pending notice cuts a paced nap on its other room', async () => {
+    const origin = new FakeOrigin();
+    const pool = new HostPool({ origin: ORIGIN, transport: origin, limits: { syncIntervalMs: 0 } });
+    // quietMs above maxDelayMs: each notice is due 15 s after its first activity, whatever follows.
+    const fixed = { quietMs: 20_000, maxDelayMs: 15_000, minWakeIntervalMs: 0 };
+    const t = scope(origin, { pool, scopeKey: 'scope-t', coalesce: fixed });
+    const s = scope(origin, { pool, scopeKey: 'scope-s', coalesce: fixed });
+    const r2Polls: number[] = [];
+    const r2Naps: { at: number; ms: number }[] = [];
+    pool.onEvent((e) => {
+      if (e.room !== 'r2') return;
+      if (e.type === 'poll-start') r2Polls.push(Date.now());
+      if (e.type === 'poll-paced') r2Naps.push({ at: Date.now(), ms: Number(e.detail?.ms) });
+    });
+    await t.w.subscribe('r2');
+    await s.w.subscribe('r1');
+    await vi.advanceTimersByTimeAsync(100);
+    origin.model.post('r1', 'a', 'x'); // S: a notice pending for r1 only
+    origin.model.post('r2', 'a', 'm1'); // T: a notice pending for r2
+    await vi.advanceTimersByTimeAsync(500);
+    origin.model.post('r2', 'a', 'm2');
+    await until(() => r2Naps.some((n) => n.ms >= 5000));
+    // Posted during r2's nap, so T has not seen them; S then joins r2 at its head (seq 4).
+    origin.model.post('r2', 'a', 'm3');
+    origin.model.post('r2', 'a', 'm4');
+    await vi.advanceTimersByTimeAsync(100);
+    const joined = Date.now();
+    await s.w.subscribe('r2');
+    await vi.advanceTimersByTimeAsync(200);
+    // The wake re-read r2 from T's head: seqs 3..4 went to T's notice only, and r2 naps again because
+    // S still has its r1 notice pending.
+    expect(t.w.status().subscriptions[0]).toMatchObject({ room: 'r2', headSeq: 4 });
+    expect(r2Naps.filter((n) => n.at >= joined && n.ms >= 5000)).toHaveLength(1);
+    const napAt = r2Naps.at(-1)!.at;
+    expect(r2Polls.filter((p) => p > napAt)).toEqual([]);
+    // S leaves r1: S has nothing pending any more, so r2 must be read again at once.
+    const left = Date.now();
+    await s.w.unsubscribe('r1');
+    expect(s.w.status().pendingNotice).toBe(false);
+    await vi.advanceTimersByTimeAsync(20);
+    expect(r2Polls.filter((p) => p >= left)).toHaveLength(1);
+    await s.w.dispose();
+    await t.w.dispose();
+    await pool.dispose();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('a member without pendingNotice(), or one that throws, never stops the room from being read', async () => {
+    for (const pacing of [true, false]) {
+      for (const kind of ['missing', 'throws'] as const) {
+        const origin = new FakeOrigin();
+        const pool = new HostPool({ origin: ORIGIN, transport: origin, limits: { floodRepollPacing: pacing } });
+        const errors: WatchEvent[] = [];
+        pool.onEvent((e) => {
+          if (e.type === 'error') errors.push(e);
+        });
+        const member = new ScriptedMember('plain', 0);
+        if (kind === 'throws') {
+          member.pendingNotice = () => {
+            throw new Error('boom');
+          };
+        }
+        const off = pool.attach(member);
+        await vi.advanceTimersByTimeAsync(100);
+        await flood(origin, 'plain', 5, 1000);
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(errors, `${kind}, pacing ${pacing}`).toEqual([]);
+        expect(member.headSeq, `${kind}, pacing ${pacing}`).toBe(5);
+        off();
+        await pool.dispose();
+      }
+    }
+  });
+
+  it('a pending notice due beyond the Date range never stops polling', async () => {
+    // Direct: a member whose notice is due at Number.MAX_SAFE_INTEGER.
+    const origin = new FakeOrigin();
+    const pool = new HostPool({ origin: ORIGIN, transport: origin });
+    const events: WatchEvent[] = [];
+    pool.onEvent((e) => events.push(e));
+    const member = new ScriptedMember('far', 0, (m) => (m.headSeq ? fixedAt(Number.MAX_SAFE_INTEGER) : undefined));
+    const off = pool.attach(member);
+    await vi.advanceTimersByTimeAsync(100);
+    await flood(origin, 'far', 5, 3000);
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect(events.filter((e) => e.type === 'error')).toEqual([]);
+    expect(member.headSeq).toBe(5);
+    const paced = events.filter((e) => e.type === 'poll-paced');
+    expect(paced.length).toBeGreaterThan(0);
+    expect(paced[0]!.detail?.noticeAt).toBe(Number.MAX_SAFE_INTEGER);
+    off();
+    await pool.dispose();
+
+    // Through createWatcher: "effectively never" coalescer timings.
+    const origin2 = new FakeOrigin();
+    const s = scope(origin2, { coalesce: { quietMs: Number.MAX_SAFE_INTEGER, maxDelayMs: Number.MAX_SAFE_INTEGER, minWakeIntervalMs: 0 } });
+    await s.w.subscribe('far');
+    await vi.advanceTimersByTimeAsync(100);
+    await flood(origin2, 'far', 5, 3000);
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect(s.events.filter((e) => e.type === 'error')).toEqual([]);
+    const st = s.w.status();
+    expect(st.subscriptions[0]).toMatchObject({ headSeq: 5 });
+    expect(st.pendingNotice).toBe(true);
+    expect(s.notices).toEqual([]);
+    await s.w.dispose();
+    expect(vi.getTimerCount()).toBe(0);
   });
 });

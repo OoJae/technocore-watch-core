@@ -76,4 +76,69 @@ describe('Coalescer (fake time)', () => {
     c.dispose();
     expect(vi.getTimerCount()).toBe(0);
   });
+
+  it('pendingTiming: movable while quietMs can still push the due time, fixed once maxDelayMs or minWakeIntervalMs holds it', async () => {
+    const t0 = Date.now();
+    const c = new Coalescer(() => undefined, { quietMs: 2000, maxDelayMs: 10_000, minWakeIntervalMs: 10_000 });
+    expect(c.pendingTiming()).toBeUndefined();
+    c.add(delta('r', 0, 1));
+    // quietMs drives it: any later activity moves it.
+    expect(c.pendingTiming()).toEqual({ dueAt: t0 + 2000, movableFrom: t0 });
+    for (let i = 1; i <= 9; i++) {
+      await vi.advanceTimersByTimeAsync(1000);
+      c.add(delta('r', i, 1));
+    }
+    // t0 + 9 s: maxDelayMs caps it at t0 + 10 s, whatever arrives.
+    expect(c.pendingTiming()).toEqual({ dueAt: t0 + 10_000, movableFrom: t0 + 10_000 });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(c.pendingTiming()).toBeUndefined();
+    // Flushed at t0 + 10 s. Activity at t0 + 11 s: minWakeIntervalMs holds it at t0 + 20 s, but maxDelayMs
+    // (t0 + 21 s) is later, so activity after t0 + 18 s can still push it out.
+    await vi.advanceTimersByTimeAsync(1000);
+    c.add(delta('r', 10, 1));
+    expect(c.pendingTiming()).toEqual({ dueAt: t0 + 20_000, movableFrom: t0 + 18_000 });
+    c.dispose();
+    // Now t0 + 11 s.
+    const d = new Coalescer(() => undefined, { quietMs: 2000, maxDelayMs: 10_000, minWakeIntervalMs: 30_000 });
+    d.add(delta('r', 0, 1));
+    d.flushNow();
+    await vi.advanceTimersByTimeAsync(1000);
+    d.add(delta('r', 1, 1));
+    // minWakeIntervalMs holds it at t0 + 41 s, later than activity could ever push it (maxDelayMs: t0 + 22 s): fixed.
+    expect(d.pendingTiming()).toEqual({ dueAt: t0 + 41_000, movableFrom: t0 + 41_000 });
+    d.dispose();
+    const q = new Coalescer(() => undefined, { quietMs: 0, maxDelayMs: 10_000, minWakeIntervalMs: 10_000 });
+    q.add(delta('r', 0, 1));
+    q.flushNow();
+    q.add(delta('r', 1, 1));
+    // Without quietMs nothing moves it (minWakeIntervalMs holds it at t0 + 22 s, maxDelayMs is no later).
+    expect(q.pendingTiming()).toEqual({ dueAt: t0 + 22_000, movableFrom: t0 + 22_000 });
+    q.dispose();
+  });
+
+  it('a due time beyond the longest timer arms the longest timer instead of one that fires at once', () => {
+    const delays: number[] = [];
+    const fns: (() => void)[] = [];
+    let now = 1_000_000;
+    const clock = {
+      now: () => now,
+      setTimeout: (fn: () => void, ms: number) => {
+        delays.push(ms);
+        fns.push(fn);
+        return fns.length;
+      },
+      clearTimeout: () => undefined,
+    };
+    const out: FlushBatch[] = [];
+    const c = new Coalescer((b) => out.push(b), { quietMs: Number.MAX_SAFE_INTEGER, maxDelayMs: Number.MAX_SAFE_INTEGER, clock });
+    c.add(delta('r', 0, 1));
+    expect(delays).toEqual([2 ** 31 - 1]);
+    // When it fires the notice is still not due: it re-arms (bounded again) and does not flush.
+    now += 2 ** 31 - 1;
+    fns.at(-1)!();
+    expect(delays).toEqual([2 ** 31 - 1, 2 ** 31 - 1]);
+    expect(out).toEqual([]);
+    expect(c.hasPending).toBe(true);
+    c.dispose();
+  });
 });

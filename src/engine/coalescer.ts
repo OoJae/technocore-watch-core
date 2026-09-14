@@ -6,7 +6,10 @@ import { isDidKey } from '../protocol/names.ts';
 import { previewText } from '../protocol/render.ts';
 import type { GapRecord, Message, NoticeRoom } from '../protocol/types.ts';
 import { type Clock, type TimerHandle, systemClock } from '../limits/clock.ts';
-import { type CoalesceOptions, DEFAULT_COALESCE, type TransportKind } from './types.ts';
+import { type CoalesceOptions, DEFAULT_COALESCE, type PendingNoticeTiming, type TransportKind } from './types.ts';
+
+/** Longest delay a timer takes; longer ones fire after 1 ms, which would re-arm in a tight loop. */
+const MAX_TIMER_MS = 2 ** 31 - 1;
 
 export interface RoomDelta {
   room: string;
@@ -98,6 +101,20 @@ export class Coalescer {
     return this.dueAt;
   }
 
+  /**
+   * When the pending notice is due and whether new activity can still move that, or undefined when
+   * nothing is pending. Activity observed at `t` moves the due time to min(first + maxDelayMs,
+   * t + quietMs) when that is later, so it can move only while first + maxDelayMs is later than the due
+   * time, and only for activity after dueAt - quietMs.
+   */
+  pendingTiming(): PendingNoticeTiming | undefined {
+    if (this.disposed || this.pending.size === 0 || this.dueAt === undefined) return undefined;
+    const dueAt = this.dueAt;
+    const cap = this.firstAt + this.opts.maxDelayMs;
+    if (!(this.opts.quietMs > 0) || !(cap > dueAt)) return { dueAt, movableFrom: dueAt };
+    return { dueAt, movableFrom: dueAt - this.opts.quietMs };
+  }
+
   add(d: RoomDelta): void {
     if (this.disposed) return;
     const count = d.countOverride ?? d.delivered.length;
@@ -176,6 +193,7 @@ export class Coalescer {
     if (this.timer !== undefined && this.dueAt === due) return;
     this.cancelTimer();
     this.dueAt = due;
+    // A due time beyond the longest timer (e.g. "effectively never" timings) is re-checked when it fires.
     this.timer = this.clock.setTimeout(() => {
       this.timer = undefined;
       this.dueAt = undefined;
@@ -186,7 +204,7 @@ export class Coalescer {
         return;
       }
       this.flushNow();
-    }, Math.max(0, due - this.clock.now()));
+    }, Math.min(MAX_TIMER_MS, Math.max(0, due - this.clock.now())));
   }
 
   /** Emit the pending notice immediately (ignores timing). No-op when nothing is pending. */
