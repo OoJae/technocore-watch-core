@@ -95,11 +95,30 @@ export function summarize(trace: BenchTrace) {
   const idleReq = trace.requests.filter((r) => r.startedAt >= trace.startedAt + 5000 && r.startedAt < idleWindowEnd && r.class !== 'config');
   const idleMinutes = Math.max(1e-9, (idleWindowEnd - trace.startedAt - 5000) / 60_000);
   const afterRestart = trace.restartAt ? trace.notices.filter((n) => n.t >= trace.restartAt!) : [];
+  // Room reads (everything but /config) overall and in the flood (workload minutes 4-9), also per
+  // room-minute over the unique rooms the pool follows at once (a shared room is read once for all scopes).
+  const reads = trace.requests.filter((r) => r.class !== 'config');
+  const floodFrom = trace.startedAt + 4 * 60_000 * trace.scale;
+  const floodTo = trace.startedAt + 9 * 60_000 * trace.scale;
+  const floodReads = reads.filter((r) => r.startedAt >= floodFrom && r.startedAt < floodTo).length;
+  const floodMinutes = Math.max(1e-9, (floodTo - floodFrom) / 60_000);
+  const uniqueRooms = new Set(Object.values(trace.subscriptions).flat()).size;
   return {
     minutes: Number(minutes.toFixed(2)),
     wakeLatencyMs: { all: stats(all), byKind: Object.fromEntries(Object.entries(wake).map(([k, v]) => [k, stats(v)])) },
     seenLatencyMs: stats(seenLat),
-    originRequests: { total: trace.requests.length, byClass, perMinute, idlePerMinute: Number((idleReq.length / idleMinutes).toFixed(2)) },
+    originRequests: {
+      total: trace.requests.length,
+      byClass,
+      perMinute,
+      idlePerMinute: Number((idleReq.length / idleMinutes).toFixed(2)),
+      readsPerMinute: Number((reads.length / Math.max(1e-9, minutes)).toFixed(2)),
+      floodReadsPerMinute: Number((floodReads / floodMinutes).toFixed(2)),
+      uniqueRooms,
+      readsPerRoomMinute: Number((reads.length / Math.max(1e-9, minutes * uniqueRooms)).toFixed(2)),
+      floodReadsPerRoomMinute: Number((floodReads / (floodMinutes * Math.max(1, uniqueRooms))).toFixed(2)),
+    },
+    noticesInFlood: trace.notices.filter((n) => n.t >= floodFrom && n.t < floodTo).length,
     status429: trace.requests.filter((r) => r.status === 429).length,
     waitNotHeld: trace.waitNotHeld,
     rateLimitedEvents: trace.rateLimited,
@@ -134,11 +153,13 @@ export function markdown(summary: ReturnType<typeof summarize>, meta: Record<str
     `- total: ${summary.originRequests.total} over ${summary.minutes} min`,
     `- per minute by class: ${JSON.stringify(summary.originRequests.perMinute)}`,
     `- idle phase requests/min: ${summary.originRequests.idlePerMinute}`,
+    `- room reads/min (all but /config): whole run ${summary.originRequests.readsPerMinute}, flood (minutes 4-9) ${summary.originRequests.floodReadsPerMinute}`,
+    `- room reads per room-minute (${summary.originRequests.uniqueRooms} unique rooms followed at once): whole run ${summary.originRequests.readsPerRoomMinute}, flood ${summary.originRequests.floodReadsPerRoomMinute}`,
     `- 429 responses: ${summary.status429}; wait_held:false replies: ${summary.waitNotHeld}`,
     '',
     '## Notices',
     '',
-    `- notices: ${summary.notices} (after restart: ${summary.noticesAfterRestart})`,
+    `- notices: ${summary.notices} (after restart: ${summary.noticesAfterRestart}; during the flood: ${summary.noticesInFlood})`,
     `- notice size chars p50/p95/max: ${summary.noticeChars.p50}/${summary.noticeChars.p95}/${summary.noticeChars.max}`,
     `- duplicate notified seqs (target 0): ${summary.duplicateNotifiedSeqs}`,
     `- posts never covered by a notice: ${summary.postsUnnotified} of ${summary.posts}`,
