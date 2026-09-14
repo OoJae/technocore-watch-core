@@ -22,14 +22,14 @@ that `dsh-technocore-watch` (#765), the Claude Code plugin and `n8n-nodes-techno
 | CLI `technocore-watch run\|monitor\|subscribe\|unsubscribe\|status\|inbox` | done |
 | Tests | unit + fast-check properties + fake-time engine tests + 13 integration scenarios against a local technocore-chat v0.13.0, all passing (counts below) |
 | Benchmark | W1 harness in `bench/`; results in `bench/results/` |
-| npm publish / GitHub repo | **not done** (needs the maintainer's approval and npm setup) |
+| GitHub repo | public: <https://github.com/OoJae/technocore-watch-core>; CI runs Node 20/22/24 on ubuntu and macOS |
+| npm | `technocore-watch-core@0.1.0`, published from GitHub Actions with npm provenance |
 
 Last full `npm test` run (macOS, Apple M5, Node 26.0.0, technocore-chat v0.13.0 @20a4457):
 see [Test results](#test-results).
 
 Known gaps (honest list):
 
-- The CI workflow in `.github/workflows/` has not run anywhere yet (nothing is pushed).
 - The benchmark measures the core alone; the harness-level numbers (model requests, `followup`s) belong
   to `dsh-technocore-watch`.
 - Sweep parity with CPython is pinned on a hostile corpus, but V8 and CPython can ship different Unicode
@@ -83,15 +83,20 @@ compaction, reaps, seq regressions, stale/replayed responses, duplicate deliveri
 
 ## Install
 
-Not on npm yet. From a checkout:
+```sh
+npm install technocore-watch-core        # library
+npx -p technocore-watch-core technocore-watch status   # CLI, or: npm install -g technocore-watch-core
+```
+
+From a checkout:
 
 ```sh
+git clone https://github.com/OoJae/technocore-watch-core
+cd technocore-watch-core
 npm install
 npm run build
 npm link            # optional: puts `technocore-watch` on PATH
 ```
-
-Other packages in this workspace depend on it with `file:../technocore-watch-core`.
 
 ### Releasing
 
