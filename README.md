@@ -369,15 +369,18 @@ Running them needs `uv` and a technocore-chat checkout at v0.13.0 with `uv sync 
 (`TECHNOCORE_SKIP_SLOW=1`); `npm test` runs everything.
 
 <!-- test-results:start -->
-Last full `npm test` after the default coalescing change (2026-09-14, Apple M5 16 GB, macOS 26, uv 0.11.14,
-technocore-chat v0.13.0 @20a4457, slow scenarios included): build + typecheck + secret scan OK, then
-**29 test files, 141 tests passed, 0 failed, 0 skipped** — unit 118, property 4, integration 19 — on
-**Node 26.0.0**. Node 20 and 22 were not re-run for this change (no local binaries; CI covers 20/22/24).
-Scenario 13 (after the pacing fixes) in two separate runs of its file: the 15 s, 300-message flood cost 67 and 76 room reads
-(per notice window 44, 12, 11 in the run that printed them; the first window is read live while `quietMs`
-drives it), the pacing-off control 155 reads for 160 messages, 1 export for the surge, no gaps, and
-single messages were seen by the poll in 11-38 ms. The earlier pacing code read the flood 8 times, but it
-moved notices (see CHANGELOG).
+Last full `npm test` at `21d9f4d` (bench report additions on top of the default coalescing change; engine
+unchanged), 2026-09-14, Apple M5 16 GB, macOS 26.6.2, uv 0.11.14, technocore-chat v0.13.0 @20a4457, slow
+scenarios included: build + typecheck + secret scan OK, then **30 test files, 143 tests passed, 0 failed,
+0 skipped** — unit 120, property 4, integration 19 — on **Node 26.0.0**. Node 20 and 22 were not re-run
+(no local binaries; CI covers 20/22/24). The full run just before it failed once in scenario 13 (flood
+reads per notice window 51, 31, 10 against its bound of 20 after the first window) while the integration
+files ran in parallel; the file alone then passed twice and the next full run passed. Treat that bound as
+load-sensitive. Earlier, scenario 13 (after the pacing fixes) in two separate runs of its file: the 15 s,
+300-message flood cost 67 and 76 room reads (per notice window 44, 12, 11 in the run that printed them; the
+first window is read live while `quietMs` drives it), the pacing-off control 155 reads for 160 messages, 1
+export for the surge, no gaps, and single messages were seen by the poll in 11-38 ms. The earlier pacing code
+read the flood 8 times, but it moved notices (see CHANGELOG).
 <!-- test-results:end -->
 
 ## Benchmark
@@ -388,31 +391,65 @@ an 8-message burst, a 5 msg/s flood for five minutes, a message every 45 s, a ho
 messages, against a local server at production-like settings (`CHAT_WAIT_POLL=0.5`,
 `CHAT_RATE_READ=600`, `CHAT_MAX_WAITERS_PER_IP=4`) through the counting proxy. It reports wake latency
 (post 200 -> notice) p50/p95/max by event kind, origin requests per minute by class, 429s, `wait_held:false`
-replies, notices and duplicate notified seqs after the restart. Results: `bench/results/`.
+replies, notices and duplicate notified seqs after the restart, plus room reads in the flood and per
+room-minute. Results: `bench/results/`.
 
 <!-- bench-results:start -->
-Full W1 run (`bench/results/2026-09-13-488d6e8-scale1.md`, Apple M5 16 GB, Node 26.0.0, one run). It was
-recorded before the review fixes. After the fixes, only a scale-0.05 smoke run was made (0 duplicate
-notified seqs, 0 of 105 posts left out of a notice, 0 429s); its output was not kept.
+Full W1 run on the current code: [`bench/results/2026-09-14-21d9f4d-scale1.md`](bench/results/2026-09-14-21d9f4d-scale1.md)
+/ [`.json`](bench/results/2026-09-14-21d9f4d-scale1.json) (raw trace included). Commit `21d9f4d` (the engine of
+`ca4b04d` plus the flood-phase and per-room read rows in the bench report), default coalescing (quiet 2 s /
+max delay 7 s / min wake 8 s) and pool limits (3 long-poll slots, flood re-poll pacing on), Apple M5 16 GB,
+macOS 26.6.2, Node 26.0.0, 2026-09-14. **One run**, no agent harness (latency ends when `onNotice` fires),
+with a no-sleep assertion held; the longest stretch without an origin request was 10.0 s.
 
 | Wake latency, post 200 -> notice (ms) | n | p50 | p95 | max |
 |---|---|---|---|---|
-| 8-message burst | 16 | 2020 | 2142 | 2142 |
-| trickle (1 per 45 s) | 19 | 2195 | 17196 | 17196 |
-| single messages after restart | 3 | 3098 | 11196 | 11196 |
-| flood (5 msg/s for 5 min) | 1493 | 15280 | 28779 | 30453 |
-| stage: seen by the poll | 1531 | 247 | 474 | 9194 |
+| all posts | 1525 | 4430 | 8088 | 8679 |
+| 8-message burst | 16 | 2061 | 2147 | 2147 |
+| trickle (1 per 45 s) | 19 | 2206 | 8167 | 8167 |
+| flood (5 msg/s for 5 min) | 1487 | 4515 | 8088 | 8494 |
+| single messages after restart | 3 | 4323 | 8679 | 8679 |
+| stage: seen by the poll | 1525 | 3336 | 7088 | 7497 |
 
-- Origin requests: 963 in 15.9 min; per minute `read-wait` 52.9, `read` 7.5, `/config` 0.06. Idle phase:
-  26.1/min for 5 distinct rooms = 3 long-poll slots x 6/min + 2 swept rooms x 4/min, as designed.
-- 429 responses: 0. `wait_held:false` replies: 7 (around the restart, while the origin still held the
-  previous process's waiters; each led to a sleep, not a re-poll).
-- Notices: 26 (8 after the restart), 572-703 characters; **duplicate notified seqs: 0**; posts never covered
-  by a notice: 0 of 1,523.
-- Flood latency is the coalescer doing its job: `minWakeIntervalMs` (30 s, the default when this run was
-  recorded; 8 s now) caps wakes per scope, so a flood produced one notice per 30 s instead of one per
-  message. Burst latency is `quietMs` (2 s) plus the
-  0.5 s server wake. The swept rooms account for the 9.2 s stage maximum (sweep interval 15 s).
+- Origin requests: 474 in 15.6 min. Room reads 30.4/min (`read-wait` 22.1, `read` 8.2), `/config` 0.06/min.
+  Idle phase 26.4/min for 5 distinct rooms (3 long-poll slots x 6/min + 2 swept rooms x 4/min, as designed);
+  flood (minutes 4-9) 37.2/min. Per room-minute: 6.07 overall, 7.44 in the flood.
+- 429 responses: 0. `wait_held:false` replies: 5 (the engine sleeps on one instead of re-polling; integration
+  scenario 9).
+- Notices: 54 (9 after the restart, 37 during the flood), 576-701 characters; **duplicate notified seqs: 0**;
+  posts never covered by a notice: 0 of 1,517.
+- A steady flood gets one notice per scope every `max(minWakeIntervalMs, maxDelayMs)` = 8 s, so flood latency
+  is roughly uniform over 8 s (p50 4.5 s, p95 8.1 s). Pacing reads the flooded room just before each notice
+  instead of after every message, which is why seen-by-poll p50 is 3.3 s here (1,487 of the 1,525 post x
+  scope pairs are flood messages) and why flood reads are 37/min instead of 141/min. A burst costs `quietMs`
+  (2 s) plus the server's 0.5 s wake; a single message in a room without a long-poll slot also waits for the
+  sweep (every 15 s or more).
+- The same workload through a real DSH agent loop (`dsh-technocore-watch`, 3 runs per mode) gave medians of
+  4,413 / 8,076 ms wake p50 / p95 and 30.6 reads/min, within 1% of these numbers, against 9,181 / 18,914 ms
+  and 14.1 reads/min (with 221 model requests instead of 54) for an ideal `wait_for_message` loop; see its
+  README for the comparison and the fairness notes. This file is one run on one laptop: indicative, not
+  statistics.
+
+Historical, superseded: [`bench/results/2026-09-13-488d6e8-scale1.md`](bench/results/2026-09-13-488d6e8-scale1.md)
+(one run at `488d6e8`, before the review fixes, flood re-poll pacing and the default change; coalescing then
+2 s / 10 s / 30 s). Its flood and per-room read rates below were recomputed from its raw trace with the current
+report code.
+
+| metric | 2026-09-14 `21d9f4d` (current) | 2026-09-13 `488d6e8` (historical) |
+|---|---|---|
+| wake latency p50 / p95 / max, all posts (ms) | 4430 / 8088 / 8679 | 14978 / 28758 / 30453 |
+| flood p50 / p95 (ms) | 4515 / 8088 | 15280 / 28779 |
+| burst / trickle / single p50 (ms) | 2061 / 2206 / 4323 | 2020 / 2195 / 3098 |
+| seen by the poll p50 / p95 / max (ms) | 3336 / 7088 / 7497 | 247 / 474 / 9194 |
+| room reads/min: whole run / idle / flood | 30.4 / 26.4 / 37.2 | 60.4 / 26.1 / 141.0 |
+| room reads per room-minute: whole run / flood | 6.07 / 7.44 | 12.08 / 28.2 |
+| notices (after restart / during flood) | 54 (9 / 37) | 26 (8 / 10) |
+| duplicate notified seqs / posts never covered | 0 / 0 of 1,517 | 0 / 0 of 1,523 |
+| 429s / `wait_held:false` | 0 / 5 | 0 / 7 |
+
+The current defaults cut wake latency to about a third and flood reads to about a quarter, for twice the
+notices (each notice is one model turn in a harness). The old trace also has one unexplained 108 s stretch
+without any origin request from workload minute 13.5 (its posts were still covered by notices).
 <!-- bench-results:end -->
 
 ## Tested versions
