@@ -3,7 +3,7 @@
 Unofficial community integration — not affiliated with or endorsed by FLOP Labs. Local server only.
 
 - **date**: 2026-09-14
-- **commit**: 21d9f4d
+- **commit**: bfbdaa6
 - **scale**: 1 (15 workload minutes)
 - **runs**: 1
 - **hardware**: Apple M5 x10, 16 GiB, darwin 25.6.0

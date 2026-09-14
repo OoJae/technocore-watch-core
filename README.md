@@ -369,7 +369,7 @@ Running them needs `uv` and a technocore-chat checkout at v0.13.0 with `uv sync 
 (`TECHNOCORE_SKIP_SLOW=1`); `npm test` runs everything.
 
 <!-- test-results:start -->
-Last full `npm test` at `21d9f4d` (bench report additions on top of the default coalescing change; engine
+Last full `npm test` at `bfbdaa6` (bench report additions on top of the default coalescing change; engine
 unchanged), 2026-09-14, Apple M5 16 GB, macOS 26.6.2, uv 0.11.14, technocore-chat v0.13.0 @20a4457, slow
 scenarios included: build + typecheck + secret scan OK, then **30 test files, 143 tests passed, 0 failed,
 0 skipped** — unit 120, property 4, integration 19 — on **Node 26.0.0**. Node 20 and 22 were not re-run
@@ -395,9 +395,9 @@ replies, notices and duplicate notified seqs after the restart, plus room reads 
 room-minute. Results: `bench/results/`.
 
 <!-- bench-results:start -->
-Full W1 run on the current code: [`bench/results/2026-09-14-21d9f4d-scale1.md`](bench/results/2026-09-14-21d9f4d-scale1.md)
-/ [`.json`](bench/results/2026-09-14-21d9f4d-scale1.json) (raw trace included). Commit `21d9f4d` (the engine of
-`ca4b04d` plus the flood-phase and per-room read rows in the bench report), default coalescing (quiet 2 s /
+Full W1 run on the current code: [`bench/results/2026-09-14-bfbdaa6-scale1.md`](bench/results/2026-09-14-bfbdaa6-scale1.md)
+/ [`.json`](bench/results/2026-09-14-bfbdaa6-scale1.json) (raw trace included). Commit `bfbdaa6` (the engine of
+`3a47f92` plus the flood-phase and per-room read rows in the bench report), default coalescing (quiet 2 s /
 max delay 7 s / min wake 8 s) and pool limits (3 long-poll slots, flood re-poll pacing on), Apple M5 16 GB,
 macOS 26.6.2, Node 26.0.0, 2026-09-14. **One run**, no agent harness (latency ends when `onNotice` fires),
 with a no-sleep assertion held; the longest stretch without an origin request was 10.0 s.
@@ -430,12 +430,12 @@ with a no-sleep assertion held; the longest stretch without an origin request wa
   README for the comparison and the fairness notes. This file is one run on one laptop: indicative, not
   statistics.
 
-Historical, superseded: [`bench/results/2026-09-13-488d6e8-scale1.md`](bench/results/2026-09-13-488d6e8-scale1.md)
-(one run at `488d6e8`, before the review fixes, flood re-poll pacing and the default change; coalescing then
+Historical, superseded: [`bench/results/2026-09-13-fd67816-scale1.md`](bench/results/2026-09-13-fd67816-scale1.md)
+(one run at `fd67816`, before the review fixes, flood re-poll pacing and the default change; coalescing then
 2 s / 10 s / 30 s). Its flood and per-room read rates below were recomputed from its raw trace with the current
 report code.
 
-| metric | 2026-09-14 `21d9f4d` (current) | 2026-09-13 `488d6e8` (historical) |
+| metric | 2026-09-14 `bfbdaa6` (current) | 2026-09-13 `fd67816` (historical) |
 |---|---|---|
 | wake latency p50 / p95 / max, all posts (ms) | 4430 / 8088 / 8679 | 14978 / 28758 / 30453 |
 | flood p50 / p95 (ms) | 4515 / 8088 | 15280 / 28779 |
