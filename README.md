@@ -380,7 +380,12 @@ Running them needs `uv` and a technocore-chat checkout at v0.13.0 with `uv sync 
 (`TECHNOCORE_SKIP_SLOW=1`); `npm test` runs everything.
 
 <!-- test-results:start -->
-Last full `npm test` at `bfbdaa6` (bench report additions on top of the default coalescing change; engine
+Last full `npm test` at `71d4bd8` (docs, publish workflow and its repository-hygiene test; `src` unchanged
+since `3a47f92`), 2026-09-14, Apple M5 16 GB, macOS 26.6.2, Node 26.0.0, slow scenarios included: build +
+typecheck + secret scan OK, then **30 test files, 144 tests passed, 0 failed, 0 skipped** (one test more
+than the run below: the workflows' action majors).
+
+The run before it at `bfbdaa6` (bench report additions on top of the default coalescing change; engine
 unchanged), 2026-09-14, Apple M5 16 GB, macOS 26.6.2, uv 0.11.14, technocore-chat v0.13.0 @20a4457, slow
 scenarios included: build + typecheck + secret scan OK, then **30 test files, 143 tests passed, 0 failed,
 0 skipped** — unit 120, property 4, integration 19 — on **Node 26.0.0**. Node 20 and 22 were not re-run
