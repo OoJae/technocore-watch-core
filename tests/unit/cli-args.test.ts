@@ -22,4 +22,18 @@ describe('CLI argument handling', () => {
     expect(await main(['status', '--origin', 'ftp://x'], io)).toBe(1);
     expect(err.join('\n')).toContain('valid room name');
   });
+
+  it('validates the flood pacing flags before taking the poller lock', async () => {
+    const err: string[] = [];
+    const io = { out: () => undefined, err: (s: string) => err.push(s), env: {} };
+    const base = ['--data', '/nonexistent-never-created', '--origin', 'http://127.0.0.1:9'];
+    expect(await main(['run', '--flood-pacing', 'maybe', ...base], io)).toBe(2);
+    expect(await main(['run', '--repoll-lead-ms', '10001', ...base], io)).toBe(2);
+    expect(await main(['monitor', '--flood-repoll-min-ms', '99', ...base], io)).toBe(2);
+    expect(err).toEqual([
+      '--flood-pacing must be on or off',
+      '--repoll-lead-ms must be a number in [0, 10000]',
+      '--flood-repoll-min-ms must be a number in [100, 10000]',
+    ]);
+  });
 });

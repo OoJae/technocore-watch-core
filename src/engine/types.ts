@@ -29,6 +29,26 @@ export interface Limits {
   subscriptionTtlDays: number;
   /** How often a watcher checks the store for changes made by other processes (0 = never). */
   syncIntervalMs: number;
+  /**
+   * Flood re-poll pacing. After a poll that returned messages, when EVERY subscription following the
+   * room already has a pending notice, the room's poller does not re-poll at once: new messages would
+   * only merge into notices that are not due yet. It naps until `repollLeadMs` before the earliest of
+   * those notices is due, at least `floodRepollMinMs` and at most the long-poll wait, so the last poll
+   * lands just before the flush. A wake (new subscriber, slot change), a notice that flushes or is
+   * dropped early, unsubscribe and dispose all cut the nap.
+   *
+   * A nap never lets a notice go out early on `quietMs` with part of a burst: when the due time is
+   * still being pushed out by arriving activity and is closer than lead + floor, there is no nap. It also never naps so long that, at the rate the last reads showed, more than
+   * half a 200-message read page piles up (which would need an export to fill in). Messages stay on
+   * the origin meanwhile, so nothing is lost; `headSeq`/`unread` just advance at that pace during a
+   * flood, and messages that land inside the lead window go into the next notice. false = re-poll
+   * immediately. Pool-level: read from the HostPool's limits.
+   */
+  floodRepollPacing: boolean;
+  /** How long before the earliest pending notice is due the paced re-poll lands (ms, 0..10000). */
+  repollLeadMs: number;
+  /** Shortest paced nap (ms, 100..10000), so a notice that is already due never causes a tight loop. */
+  floodRepollMinMs: number;
 }
 
 export const DEFAULT_LIMITS: Limits = {
@@ -53,7 +73,40 @@ export const DEFAULT_LIMITS: Limits = {
   cacheMessages: 2000,
   subscriptionTtlDays: 7,
   syncIntervalMs: 2000,
+  floodRepollPacing: true,
+  repollLeadMs: 500,
+  floodRepollMinMs: 1000,
 };
+
+/** Bounds for the flood re-poll pacing limits (see Limits). */
+export const PACING_BOUNDS = {
+  repollLeadMs: { min: 0, max: 10_000 },
+  floodRepollMinMs: { min: 100, max: 10_000 },
+} as const;
+
+/** Drops keys whose value is undefined, so merging over DEFAULT_LIMITS never erases a default. */
+export function definedLimits(l: Partial<Limits> | undefined): Partial<Limits> {
+  return Object.fromEntries(Object.entries(l ?? {}).filter(([, v]) => v !== undefined)) as Partial<Limits>;
+}
+
+/**
+ * Throws a RangeError/TypeError for limits that would break polling. Only the fields validated here
+ * are checked; returns the same object.
+ */
+export function validateLimits<T extends Partial<Limits>>(l: T): T {
+  if (l.floodRepollPacing !== undefined && typeof l.floodRepollPacing !== 'boolean') {
+    throw new TypeError('limits.floodRepollPacing must be a boolean');
+  }
+  for (const key of ['repollLeadMs', 'floodRepollMinMs'] as const) {
+    const v = l[key];
+    if (v === undefined) continue;
+    const { min, max } = PACING_BOUNDS[key];
+    if (typeof v !== 'number' || !Number.isFinite(v) || v < min || v > max) {
+      throw new RangeError(`limits.${key} must be a number in [${min}, ${max}]`);
+    }
+  }
+  return l;
+}
 
 export interface CoalesceOptions {
   quietMs: number;
@@ -76,6 +129,7 @@ export interface Observation {
 export type WatchEventType =
   | 'poll-start'
   | 'poll-end'
+  | 'poll-paced'
   | 'rate-limited'
   | 'wait-not-held'
   | 'network-error'
@@ -112,6 +166,12 @@ export interface RoomMember {
   /** The generation this member last settled; a view reporting another one is always forwarded. */
   generation(): number | undefined;
   active(): boolean;
+  /**
+   * Epoch ms at which the notice this member already has pending is due, or undefined when none is
+   * pending. The room's poller paces flood re-polls only while every active member has one; a member
+   * whose pending notice goes away early (flushed, dropped) should get HostPool.noticeChanged(room).
+   */
+  nextNoticeAt(): number | undefined;
   onObservation(obs: Observation): Promise<'ok' | 'retry'>;
   onFatal(refusal: Refusal): void;
 }

@@ -43,3 +43,21 @@ First version. Unofficial community integration — not affiliated with or endor
 - The dispose leak check now runs a plain-ESM child against `dist/`, so it no longer needs TypeScript
   stripping (Node 20). CI matrix: Node 20, 22, 24.
 - The secret scan also flags 32-byte seeds written as base64url/base64.
+
+### Tuning pass (still 0.1.0, unreleased)
+
+- Flood re-poll pacing (`limits.floodRepollPacing`, default on; `repollLeadMs` 500, `floodRepollMinMs`
+  1,000; CLI `--flood-pacing on|off`, `--repoll-lead-ms`, `--flood-repoll-min-ms`). A room whose every
+  subscribing scope already has a notice pending no longer re-polls after each message: it naps until
+  just before the earliest of those notices is due (capped at the long-poll wait) and is woken early by
+  a new subscriber, a slot change, a flushed or dropped notice, unsubscribe or dispose. It does not nap
+  when the due time is still being pushed out by `quietMs` and is closer than lead + floor, nor for
+  longer than half a read page takes to fill at the measured rate. Against a local server (integration
+  scenario 13) a 15 s flood at 20 msg/s cost 8 room reads (296 before this change), with no seq lost,
+  and single messages outside the flood were still seen by the poll in under 60 ms. Fake-time unit
+  tests: a 60 s flood at 5 msg/s costs 17 reads instead of 300. New `poll-paced` trace event. `RoomMember` gains `nextNoticeAt()`.
+- Pacing limits are validated (`RangeError`/`TypeError` from `HostPool` and `createWatcher`); `limits`
+  keys set to `undefined` keep their defaults instead of erasing them. `PACING_BOUNDS` and
+  `validateLimits` are exported.
+- A wake that arrived before a poll started (the slot assignment on attach) used to skip the next nap
+  after it; a poll now clears it, so only wakes that land during a poll skip the following nap.

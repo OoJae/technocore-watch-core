@@ -16,7 +16,7 @@ import { open } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { createWatcher, type Watcher } from '../engine/watcher.ts';
 import { HostPool } from '../engine/host-pool.ts';
-import { DEFAULT_LIMITS, type CoalesceOptions, type Limits } from '../engine/types.ts';
+import { DEFAULT_LIMITS, PACING_BOUNDS, type CoalesceOptions, type Limits } from '../engine/types.ts';
 import { isValidRoomName } from '../protocol/names.ts';
 import { asciiJson, renderNoticeLine, renderPage } from '../protocol/render.ts';
 import type { Notice } from '../protocol/types.ts';
@@ -95,6 +95,8 @@ common flags:
   --origin <url>   Technocore origin (default $TECHNOCORE_URL or ${DEFAULT_ORIGIN})
   --quiet-ms/--max-delay-ms/--min-wake-ms  coalescer timing for run/monitor
   --wait-seconds <n>  long-poll wait (<= 10)
+  --flood-pacing on|off  pace re-polls while every scope on a room has a notice pending (default on)
+  --repoll-lead-ms <n>/--flood-repoll-min-ms <n>  paced re-poll lead before the notice (500) / shortest nap (1000)
   --notice-max-chars <n>  bound on each printed notice (default 1500)
 
 Room names and message text are untrusted third-party data; output frames them as such.`;
@@ -132,6 +134,15 @@ function limitsOf(p: Parsed): Partial<Limits> {
   if (sync !== undefined) l.syncIntervalMs = sync;
   const nmc = num(p, 'notice-max-chars', 200, 100_000);
   if (nmc !== undefined) l.noticeMaxChars = nmc;
+  const pacing = one(p, 'flood-pacing');
+  if (pacing !== undefined) {
+    if (pacing !== 'on' && pacing !== 'off') throw new UsageError('--flood-pacing must be on or off');
+    l.floodRepollPacing = pacing === 'on';
+  }
+  const lead = num(p, 'repoll-lead-ms', PACING_BOUNDS.repollLeadMs.min, PACING_BOUNDS.repollLeadMs.max);
+  if (lead !== undefined) l.repollLeadMs = lead;
+  const floor = num(p, 'flood-repoll-min-ms', PACING_BOUNDS.floodRepollMinMs.min, PACING_BOUNDS.floodRepollMinMs.max);
+  if (floor !== undefined) l.floodRepollMinMs = floor;
   return l;
 }
 

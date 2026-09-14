@@ -22,7 +22,7 @@ export type { RoomDelta, FlushBatch, CoalescerOptions } from './engine/coalescer
 export { MessageCache } from './engine/cache.ts';
 export { createWatcher, WATCHER_ID } from './engine/watcher.ts';
 export type { Watcher, WatcherOptions, SubscribeOptions } from './engine/watcher.ts';
-export { DEFAULT_LIMITS, DEFAULT_COALESCE } from './engine/types.ts';
+export { DEFAULT_LIMITS, DEFAULT_COALESCE, PACING_BOUNDS, validateLimits } from './engine/types.ts';
 export type {
   Limits,
   CoalesceOptions,

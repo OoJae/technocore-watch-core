@@ -33,6 +33,8 @@ import {
   type SubscriptionStatusView,
   type WatchEvent,
   type WatchStatus,
+  definedLimits,
+  validateLimits,
 } from './types.ts';
 
 export const WATCHER_ID = 'technocore-watch-core/0.1.0';
@@ -127,6 +129,10 @@ class SubscriptionMember implements RoomMember {
   active(): boolean {
     const s = this.sub();
     return !!s && s.status === 'active' && !s.startFrom && !this.w.disposed;
+  }
+
+  nextNoticeAt(): number | undefined {
+    return this.w.nextNoticeAt();
   }
 
   prepare(): Promise<boolean> {
@@ -259,14 +265,14 @@ class WatcherImpl implements Watcher {
       if (o.pool.origin !== this.origin) throw new TypeError('pool origin does not match watcher origin');
       this.pool = o.pool;
       this.ownsPool = false;
-      this.limits = { ...o.pool.limits, ...o.limits };
+      this.limits = validateLimits({ ...o.pool.limits, ...definedLimits(o.limits) });
     } else {
       const poolOpts: ConstructorParameters<typeof HostPool>[0] = { origin: this.origin, clock: this.clock };
       if (o.transport) poolOpts.transport = o.transport;
       if (o.limits) poolOpts.limits = o.limits;
       this.pool = new HostPool(poolOpts);
       this.ownsPool = true;
-      this.limits = { ...DEFAULT_LIMITS, ...o.limits };
+      this.limits = { ...DEFAULT_LIMITS, ...definedLimits(o.limits) };
     }
     this.state = emptyState(this.origin, this.scopeKey, new Date(this.clock.now()));
     const coalesceOpts: ConstructorParameters<typeof Coalescer>[1] = {
@@ -392,14 +398,19 @@ class WatcherImpl implements Watcher {
 
   private syncMembers(): void {
     if (this.disposed) return;
+    let dropped = false;
     for (const [room, entry] of [...this.members]) {
       const sub = this.state.subscriptions[room];
       if (!sub || sub.status !== 'active') {
         entry.detach();
         this.members.delete(room);
-        if (!sub) this.coalescer.remove(room);
+        if (!sub) {
+          this.coalescer.remove(room);
+          dropped = true;
+        }
       }
     }
+    if (dropped) this.noticeStateChanged();
     if (!this.polling) return;
     for (const sub of Object.values(this.state.subscriptions)) {
       if (sub.status !== 'active' || this.members.has(sub.room)) continue;
@@ -539,6 +550,18 @@ class WatcherImpl implements Watcher {
 
   // ---------------------------------------------------------------- notices & events
 
+  /** When this scope's pending notice is due (epoch ms), or undefined when none is pending. */
+  nextNoticeAt(): number | undefined {
+    if (this.disposed || !this.coalescer.hasPending) return undefined;
+    return this.coalescer.nextFlushAt;
+  }
+
+  /** The pending notice flushed or lost rooms: let flood-paced pollers of this scope's rooms re-check. */
+  private noticeStateChanged(): void {
+    if (this.disposed) return;
+    for (const room of this.members.keys()) this.pool.noticeChanged(room);
+  }
+
   private nowIso(): string {
     return new Date(this.clock.now()).toISOString();
   }
@@ -555,6 +578,7 @@ class WatcherImpl implements Watcher {
 
   private emitNotice(b: FlushBatch): void {
     if (this.disposed) return;
+    this.noticeStateChanged();
     const notice: Notice = {
       id: `tcw-${randomUUID()}`,
       scopeKey: this.scopeKey,
@@ -662,6 +686,7 @@ class WatcherImpl implements Watcher {
       this.members.delete(room);
     }
     this.coalescer.remove(room);
+    this.noticeStateChanged();
     await this.mutate((s) => {
       delete s.subscriptions[room];
     }, 'now');

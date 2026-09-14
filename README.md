@@ -20,7 +20,7 @@ that `dsh-technocore-watch` (#765), the Claude Code plugin and `n8n-nodes-techno
 | `state/` `FileStateStore` / `MemoryStateStore` | done (atomic tmp+fsync+rename, revision CAS, poller lock, notice ring) |
 | `engine/` `HostPool`, coalescer, `createWatcher()` | done |
 | CLI `technocore-watch run\|monitor\|subscribe\|unsubscribe\|status\|inbox` | done |
-| Tests | unit + fast-check properties + fake-time engine tests + 12 integration scenarios against a local technocore-chat v0.13.0, all passing (counts below) |
+| Tests | unit + fast-check properties + fake-time engine tests + 13 integration scenarios against a local technocore-chat v0.13.0, all passing (counts below) |
 | Benchmark | W1 harness in `bench/`; results in `bench/results/` |
 | npm publish / GitHub repo | **not done** (needs the maintainer's approval and npm setup) |
 
@@ -34,6 +34,10 @@ Known gaps (honest list):
   to `dsh-technocore-watch`.
 - Sweep parity with CPython is pinned on a hostile corpus, but V8 and CPython can ship different Unicode
   versions, so a code point newly assigned to `Cf` in one runtime can still sweep differently.
+- Flood re-poll pacing sizes each nap from the rate the last reads showed. A flood that speeds up
+  sharply during a nap (say from 20 msg/s to hundreds) can pile up more than a 200-message read page,
+  which costs one export to fill in (no loss). Scenario 13's 600-message surge right after a flood does
+  exactly that (1 export). `--flood-pacing off` avoids it at one read per message.
 - `GET /r/<room>/export` is the only way to recover what a tail read skipped (no `before=` paging
   upstream, see #775), so a backfill can cost up to one ring download (bounded to 12 MiB / 2,000 records
   by default, one export at a time per origin).
@@ -127,7 +131,7 @@ const b = createWatcher({ origin: pool.origin, scopeKey: 'session-b', store, poo
 | `renderNotice(notice, 'framed' \| 'line')` | `renderNotice` / `renderNoticeLine` bounded by this watcher's `limits.noticeMaxChars`. |
 | `ack(room, throughSeq)` | Advance `acceptedSeq` (monotonic within a generation, clamped to `headSeq`). |
 | `markNotified(noticeId)` | The harness confirms a notice was delivered; advances `notifiedSeq`. |
-| `onNotice(fn)` / `onEvent(fn)` | Coalesced notices / trace events (`poll-start`, `poll-end`, `activity`, `rate-limited`, `wait-not-held`, `backfill`, `gap`, `recreated`, `regression`, `stale-generation`, `network-error`, ...). |
+| `onNotice(fn)` / `onEvent(fn)` | Coalesced notices / trace events (`poll-start`, `poll-end`, `poll-paced`, `activity`, `rate-limited`, `wait-not-held`, `backfill`, `gap`, `recreated`, `regression`, `stale-generation`, `network-error`, ...). |
 | `sync()` | Reload state changed by another process (also runs every `syncIntervalMs`). |
 | `dispose()` / `await using` | Abort, drain, flush, release. |
 
@@ -181,6 +185,22 @@ posted after subscribing are neither delivered nor reported as a gap.
   shared by the pool. At most 4 concurrent requests and one export per origin.
 - `wait_held: true` and empty: re-poll immediately. `wait_held: false` (no waiter slot): sleep the
   requested wait +/-20%, never a tight loop.
+- **Flood re-poll pacing** (`limits.floodRepollPacing`, on by default). A long-poll returns as soon as
+  one message arrives, so without pacing a flood costs one read per message, all merged into notices
+  that are not due yet. After a read with messages, when *every* scope following the room already has
+  a notice pending, the room's poller naps until `repollLeadMs` (500 ms) before the earliest of those
+  notices is due, at least `floodRepollMinMs` (1 s) and at most the long-poll wait (10 s), so the last
+  read lands just before the flush. A new subscriber, a slot change, a notice that flushes or is dropped
+  early (so some scope has nothing pending), unsubscribe and dispose all end the nap at once; a scope
+  that leaves while another still has a notice pending does not. Guards: no nap when the due time is
+  still being pushed out by arriving activity (`quietMs`) and is closer than lead + floor, so a burst is
+  never split; and no nap long enough for more than 100 messages (half a read page) to pile up at the
+  rate the last reads showed. Messages stay on the origin, so nothing is lost. What changes during a
+  flood: `headSeq`/`unread` advance at the paced rate, messages that land inside the 500 ms lead window
+  go into the next notice, and a flood that speeds up sharply *during* a nap can overflow a page and
+  cost one export. In a 15 s flood at 20 msg/s against a local server (integration scenario 13) the room
+  was read 8 times instead of 296; single messages outside floods are still seen by the poll within tens
+  of milliseconds (that server's `wait_poll` is 50 ms), the same as with pacing off. Set it to `false` (CLI `--flood-pacing off`) to re-poll immediately.
 - 429: honour the body's `retry after: Ns` (falling back to `Retry-After`), penalize the whole pool's
   bucket, then decorrelated jitter. Network errors and 5xx: decorrelated jitter (500 ms .. 60 s).
   400/403: the subscription goes to `status: 'error'` and stops polling. Abort beats every sleep.
@@ -221,6 +241,7 @@ one-line form for monitors; `renderPage` frames inbox pages as one escaped JSON 
 | Gap records per room | 8 (settled ones pruned; touching gaps of the same reason merged; beyond that whole records dropped, oldest `backfill-bounded` first, so a gap never widens over delivered or retained seqs and `unread` can only over-count) |
 | Message cache | 2,000 messages per room, 64 rooms (least recently used evicted); a room is dropped when its last subscriber leaves |
 | Backfill | 12 MiB, 2,000 records, one export at a time |
+| Flood re-poll pacing | on; lead 500 ms (0..10,000), shortest nap 1,000 ms (100..10,000), longest nap = long-poll wait |
 | State file / notices journal | 256 KiB / 256 KiB ring |
 | Subscription GC | idle > 7 days with nothing unread (matches server deletion) |
 
@@ -249,6 +270,7 @@ technocore-watch inbox       [room] [--max N] [--peek] [--format framed|json]
 
 common: --data <dir> --scope <key> --origin <url> --verbose
         --quiet-ms --max-delay-ms --min-wake-ms --wait-seconds --sync-ms --notice-max-chars
+        --flood-pacing on|off --repoll-lead-ms --flood-repoll-min-ms
 ```
 
 - `run` takes the poller lock for the data directory (exit code 3 if another process holds it), polls
@@ -259,6 +281,8 @@ common: --data <dir> --scope <key> --origin <url> --verbose
   The journal is a ring that gets rewritten every few hundred notices. The follower detects the
   rewrite (new inode or a shorter file) and resumes after the last notice id it printed, so each notice
   is printed once.
+- `--flood-pacing on|off` (default on), `--repoll-lead-ms` (500, 0..10,000) and `--flood-repoll-min-ms`
+  (1,000, 100..10,000) set flood re-poll pacing for `run`/`monitor` (see Polling, budgets and backoff).
 - `--notice-max-chars` (default 1,500) bounds each printed notice. `TECHNOCORE_WATCH_LOCK_HEARTBEAT_MS`
   changes the lock heartbeat (default 10,000; used by tests).
 - The bin runs only when it is the process entry point, directly or through a symlink such as npm's
@@ -294,9 +318,9 @@ dependencies (n8n community nodes) can copy it verbatim and pin a hash.
 
 | Project | What |
 |---|---|
-| `unit` | protocol parsing/sweep/render, reconcile examples (incl. origin reset and gap bounding), limits, coalescer and scheduler under fake timers, stores and the poller lock (live holder, pid reuse, takeover detection), read-only transport and its socket-closing `close()`, protocol purity, secret scan (hex and base64 seeds), engine end-to-end on an in-memory origin model under fake time (incl. a recreation whose export fails once, an origin whose generation goes down, `now` on reaped/expired rooms, notice/page/cache bounds), the CLI `monitor` follower across journal rewrites and `run` losing its lock |
+| `unit` | protocol parsing/sweep/render, reconcile examples (incl. origin reset and gap bounding), limits, coalescer and scheduler under fake timers, stores and the poller lock (live holder, pid reuse, takeover detection), read-only transport and its socket-closing `close()`, protocol purity, secret scan (hex and base64 seeds), engine end-to-end on an in-memory origin model under fake time (incl. a recreation whose export fails once, an origin whose generation goes down, `now` on reaped/expired rooms, notice/page/cache bounds, flood re-poll pacing: reads per notice window, wake/flush/unsubscribe/dispose cutting the nap, shared rooms, no split bursts, no lost seqs), the CLI `monitor` follower across journal rewrites and `run` losing its lock |
 | `property` | fast-check: delivered-or-gapped invariant, idempotence, monotonic `acceptedSeq`, notice totals, unsettled `now` starts never gapping pre-subscription seqs, `boundGaps` never widening a gap |
-| `integration` | local technocore-chat v0.13.0 per file + counting/fault-injecting proxy: the 12 scenarios below, the CLI, CLI entry-point detection (symlink vs. same-named wrapper), and Python sweep parity |
+| `integration` | local technocore-chat v0.13.0 per file + counting/fault-injecting proxy: the 13 scenarios below, the CLI, CLI entry-point detection (symlink vs. same-named wrapper), and Python sweep parity |
 
 Integration scenarios (each against the real server):
 
@@ -313,18 +337,24 @@ Integration scenarios (each against the real server):
 11. restart with the same store: no re-notify
 12. dispose: no timers or sockets left the moment `dispose()` resolves (a plain-ESM child running `dist/`
     exits on its own), proxy sees the close
+13. flood re-poll pacing: a 15 s flood at 20 msg/s is read a few times per notice window (and about once
+    per message with pacing off), then a 600-message surge; notices and pages cover every seq once with
+    no gaps, and single messages before and after the flood are seen by the poll in under a second
 
 Running them needs `uv` and a technocore-chat checkout at v0.13.0 with `uv sync --frozen` done, found at
 `$TECHNOCORE_CHECKOUT` or `../.cache/technocore-chat`. `npm run test:fast` skips the two slow scenarios
 (`TECHNOCORE_SKIP_SLOW=1`); `npm test` runs everything.
 
 <!-- test-results:start -->
-Last full `npm test` after the independent-review fixes (2026-09-13, Apple M5 16 GB, macOS 26, uv 0.11.14,
+Last full `npm test` after the flood re-poll pacing change (2026-09-14, Apple M5 16 GB, macOS 26, uv 0.11.14,
 technocore-chat v0.13.0 @20a4457, slow scenarios included): build + typecheck + secret scan OK, then
-**27 test files, 115 tests passed, 0 failed, 0 skipped** — unit 94, property 4 (400 / 300 / 300 / 300
-fast-check runs by default; also run once with `FC_NUM_RUNS=20000`, passing), integration 17 — on
-**Node 26.0.0** and again, with the same result, on **Node 20.20.2** (integration children included).
-Scenario 12 passed 4 times in a row on its own, and in both full runs.
+**29 test files, 131 tests passed, 0 failed, 0 skipped** — unit 108, property 4, integration 19 — twice on
+**Node 26.0.0** and once on **Node 22.23.2** (integration children included). Node 20 was not re-run for
+this change (no local Node 20 binary; the previous full run on Node 20.20.2 passed before it, and CI
+covers 20/22/24). Scenario 13 in those three runs: the 15 s, 300-message flood cost 8 room reads each
+time (the pacing-off control: 155 and 158 reads for 160 messages; the same scenario on the code before
+this change: 296 reads), 1 export for the surge, no gaps, and single messages were seen by the poll in
+27-51 ms.
 <!-- test-results:end -->
 
 ## Benchmark

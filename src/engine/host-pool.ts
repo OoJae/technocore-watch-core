@@ -16,7 +16,7 @@ import {
 import { TransportError, type Transport } from '../transport/http.ts';
 import { MessageCache } from './cache.ts';
 import { SlotScheduler } from './scheduler.ts';
-import { DEFAULT_LIMITS, type Limits, type Observation, type RoomMember, type WatchEvent, type WatchEventType } from './types.ts';
+import { DEFAULT_LIMITS, type Limits, type Observation, type RoomMember, type WatchEvent, type WatchEventType, definedLimits, validateLimits } from './types.ts';
 
 export interface HostPoolOptions {
   origin: string;
@@ -73,7 +73,7 @@ export class HostPool {
   constructor(o: HostPoolOptions) {
     this.clock = o.clock ?? systemClock;
     this.random = o.random ?? Math.random;
-    this.limits = { ...DEFAULT_LIMITS, ...o.limits };
+    this.limits = validateLimits({ ...DEFAULT_LIMITS, ...definedLimits(o.limits) });
     const readerOpts: { origin: string; transport?: Transport } = { origin: o.origin };
     if (o.transport) readerOpts.transport = o.transport;
     this.reader = new TechnocoreReader(readerOpts);
@@ -194,6 +194,7 @@ export class HostPool {
       const p = this.polls.get(member.room);
       if (!p) return;
       p.members.delete(member);
+      if (p.members.size > 0) p.reconsiderPacing();
       if (p.members.size === 0) {
         this.polls.delete(member.room);
         this.scheduler.remove(member.room);
@@ -211,6 +212,15 @@ export class HostPool {
 
   wake(room: string): void {
     this.polls.get(room)?.wake();
+  }
+
+  /**
+   * A member's pending notice for `room` went away or moved earlier (flushed, dropped): a poller that is
+   * pacing a flood re-checks its nap and re-polls now if the reason for the nap is gone. Unlike wake(),
+   * this never skips any other sleep.
+   */
+  noticeChanged(room: string): void {
+    this.polls.get(room)?.reconsiderPacing();
   }
 
   pollerMode(room: string): 'long-poll' | 'sweep' | 'idle' {
@@ -343,6 +353,13 @@ function generationUnsettled(members: readonly RoomMember[], generation: number 
   return members.some((m) => m.generation() !== generation);
 }
 
+/**
+ * A paced nap never lets more than this many messages pile up on the origin at the rate the last
+ * response showed: half of the 200-message read page, so the paced re-poll still gets everything in
+ * one page instead of a tail window that needs an export backfill.
+ */
+const PACED_PAGE_TARGET = 100;
+
 export class RoomPoller {
   readonly room: string;
   readonly members = new Set<RoomMember>();
@@ -350,6 +367,12 @@ export class RoomPoller {
   private readonly ctrl = new AbortController();
   private wakeCtrl: AbortController | undefined;
   private woken = false;
+  /** Set while a flood-paced nap runs: aborting `cut` ends it; `until` is when it would end. */
+  private pacing: { cut: AbortController; until: number } | undefined;
+  /** When the last successful read came back: messages above its cursor have accrued since then. */
+  private lastResponseAt: number | undefined;
+  /** Whether that read carried messages, i.e. whether the time since it measures a flow, not idling. */
+  private lastResponseHadMessages = false;
   private loop: Promise<void> | undefined;
   private readonly backoff: DecorrelatedJitter;
   private nextSweepAt = 0;
@@ -384,21 +407,110 @@ export class RoomPoller {
     return this.ctrl.signal; // HostPool.dispose() stops (aborts) every poller
   }
 
-  /** Sleep that a wake() interrupts; only a stop/dispose rejects. */
-  private async nap(ms: number): Promise<void> {
+  /** Sleep that a wake() (or `cut`) interrupts; only a stop/dispose rejects. */
+  private async nap(ms: number, cut?: AbortSignal): Promise<void> {
     if (this.woken) {
       this.woken = false;
       return;
     }
     const w = new AbortController();
     this.wakeCtrl = w;
+    const signals = [this.ctrl.signal, this.pool.signal, w.signal];
+    if (cut) signals.push(cut);
     try {
-      await sleep(ms, [this.ctrl.signal, this.pool.signal, w.signal], this.pool.clock);
+      await sleep(ms, signals, this.pool.clock);
     } catch (e) {
       if (this.ctrl.signal.aborted || this.pool.signal.aborted) throw e;
     } finally {
       this.wakeCtrl = undefined;
       this.woken = false;
+    }
+  }
+
+  /**
+   * The earliest pending-notice due time over the members this poller serves, or undefined when any of
+   * them has no pending notice (or is still resolving its start, which the loop has to retry).
+   * Paused, errored or disposed members take no observations, so they neither allow nor block pacing.
+   */
+  private earliestNoticeAt(): number | undefined {
+    let earliest: number | undefined;
+    for (const m of this.members) {
+      if (m.head() === undefined) return undefined;
+      if (!m.active()) continue;
+      const at = m.nextNoticeAt();
+      if (at === undefined || !Number.isFinite(at)) return undefined;
+      earliest = earliest === undefined ? at : Math.min(earliest, at);
+    }
+    return earliest;
+  }
+
+  /**
+   * How long to pace the next re-poll, or undefined to re-poll now. The nap aims `repollLeadMs` before
+   * the earliest pending notice is due, at least `floodRepollMinMs` and at most the long-poll wait.
+   *
+   * Rounding a short nap up to the floor lets the poll land after that due time. That is harmless when
+   * the due time is `fixed` (maxDelayMs or minWakeIntervalMs holds it where it is whatever arrives): the
+   * flush cuts the nap and the room is read right after it. When the last read moved the due time
+   * later, it is being held open by arriving activity (quietMs), and a poll that lands after it would
+   * let the notice go out early with part of a burst, so there is no nap at all then.
+   */
+  private pacedNapMs(fixed: boolean): { ms: number; noticeAt: number } | undefined {
+    const l = this.pool.limits;
+    if (!l.floodRepollPacing) return undefined;
+    const noticeAt = this.earliestNoticeAt();
+    if (noticeAt === undefined) return undefined;
+    const target = noticeAt - l.repollLeadMs - this.pool.clock.now();
+    if (target < l.floodRepollMinMs && !fixed) return undefined;
+    const ms = Math.min(this.pool.waitSeconds() * 1000, Math.max(l.floodRepollMinMs, target));
+    return { ms, noticeAt };
+  }
+
+  /** Called when members or their pending notices change: cut a paced nap whose reason is gone. */
+  reconsiderPacing(): void {
+    const p = this.pacing;
+    if (!p) return;
+    const next = this.pacedNapMs(true);
+    // Pending notices only move later while they stay pending, so only a notice that went away (or a
+    // member set whose earliest notice is sooner than the nap) needs the poll now.
+    if (!next || this.pool.clock.now() + next.ms < p.until) p.cut.abort();
+  }
+
+  /**
+   * After a poll that returned messages: nap while every member's pending notice absorbs them.
+   * `accrued` messages above the cursor piled up over the `accrualMs` before the response came back at
+   * `respondedAt` (accrualMs is undefined when that span includes idle time, e.g. the first messages
+   * after a quiet long-poll). The nap stays short enough that the next read still fits in one page at
+   * that rate, and is skipped when even the shortest nap would not. Without a rate yet, the first paced
+   * nap is the shortest one, which measures it. `dueBefore` is the earliest pending notice's due time
+   * before this observation: unchanged means it is fixed (see pacedNapMs).
+   */
+  private async paceFlood(accrued: number, accrualMs: number | undefined, respondedAt: number, dueBefore: number | undefined): Promise<void> {
+    const dueAfter = this.earliestNoticeAt();
+    const next = this.pacedNapMs(dueBefore !== undefined && dueAfter === dueBefore);
+    if (!next) return;
+    const l = this.pool.limits;
+    let ms: number;
+    if (accrualMs === undefined) {
+      // No flow measured yet. Messages that woke a long-poll arrived within about one origin
+      // wait_poll, so that is the slowest rate they can mean: skip the nap (and measure on the next
+      // read) when even that rate would overflow the page target during the shortest nap.
+      const wakeSpanMs = Math.max(1, (this.pool.originConfig?.waitPollS ?? 0.5) * 1000);
+      if (accrued * l.floodRepollMinMs > PACED_PAGE_TARGET * wakeSpanMs) return;
+      ms = Math.min(next.ms, l.floodRepollMinMs);
+    } else {
+      // Messages also pile up while the observation is processed (an export backfill can take a while).
+      const byRate = (PACED_PAGE_TARGET * Math.max(1, accrualMs)) / Math.max(1, accrued) - (this.pool.clock.now() - respondedAt);
+      if (byRate < l.floodRepollMinMs) return;
+      ms = Math.min(next.ms, Math.floor(byRate));
+    }
+    const cut = new AbortController();
+    const pacing = { cut, until: this.pool.clock.now() + ms };
+    this.pacing = pacing;
+    this.pool.emit({ type: 'poll-paced', room: this.room, detail: { ms, noticeAt: new Date(next.noticeAt).toISOString() } });
+    try {
+      await this.nap(ms, cut.signal);
+    } finally {
+      if (this.pacing === pacing) this.pacing = undefined;
     }
   }
 
@@ -428,6 +540,10 @@ export class RoomPoller {
     const pool = this.pool;
     const room = this.room;
     while (!this.ctrl.signal.aborted && !pool.signal.aborted) {
+      // This pass reads members, slots and heads afresh, so a wake from before it is already served;
+      // only a wake that lands from here on may skip the next nap. (A stale wake, e.g. the slot
+      // assignment on attach, used to skip the first paced or wait_held:false nap.)
+      this.woken = false;
       const { ready, pending } = await this.readyMembers();
       if (ready.length === 0) {
         await this.nap(pending ? this.backoff.next() : 60_000);
@@ -470,6 +586,12 @@ export class RoomPoller {
         continue;
       }
       pool.emit({ type: 'poll-end', room, detail: { since, mode: transport, ok: result.ok, status: result.status } });
+      const respondedAt = pool.clock.now();
+      const flowingSince = this.lastResponseHadMessages ? this.lastResponseAt : undefined;
+      if (result.ok) {
+        this.lastResponseAt = respondedAt;
+        this.lastResponseHadMessages = result.view.messages.length > 0;
+      }
       if (!result.ok) {
         const r = result.refusal;
         if (r.kind === 'rate') {
@@ -508,6 +630,7 @@ export class RoomPoller {
         pool.cache.add(room, view.generation, view.messages);
       }
       const obs: Observation = { room, since, view, fetchedAt: result.fetchedAt, transport };
+      const dueBefore = this.earliestNoticeAt();
       const statuses = await Promise.all(
         ready
           .filter((m) => this.members.has(m) && m.active())
@@ -523,6 +646,12 @@ export class RoomPoller {
         await this.nap(this.backoff.next());
       } else {
         this.backoff.reset();
+        // Without pacing a flood costs one read per message the origin wakes on, all merged into
+        // notices that are not due yet; see Limits.floodRepollPacing.
+        if (view.messages.length > 0) {
+          const accrued = Math.max(view.messages.length, view.last_seq - since);
+          await this.paceFlood(accrued, flowingSince === undefined ? undefined : respondedAt - flowingSince, respondedAt, dueBefore);
+        }
       }
     }
   }
