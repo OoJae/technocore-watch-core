@@ -73,3 +73,12 @@ First version. Unofficial community integration — not affiliated with or endor
   `validateLimits` are exported.
 - A wake that arrived before a poll started (the slot assignment on attach) used to skip the next nap
   after it; a poll now clears it, so only wakes that land during a poll skip the following nap.
+- Default coalescing is now `quietMs` 2,000 / `maxDelayMs` 7,000 / `minWakeIntervalMs` 8,000 (was
+  2,000 / 10,000 / 30,000). A steady flood gets one notice every 8 s instead of every 30 s, and
+  `minWakeIntervalMs` above `maxDelayMs` keeps a flood's notice held so pacing can nap. Chosen from a W1
+  sweep at scale 0.25 through dsh-technocore-watch against a `wait_for_message` loop (local server): the
+  fewest model requests (26 against the loop's 81) whose wake p50/p95, overall and in the flood, stayed
+  at or below the loop's (4.38 / 8.07 s overall and 4.62 / 8.08 s in the flood, against 4.85-4.86 /
+  9.91 s and 4.72-4.78 / 9.51 s), with the fewest origin reads among those (33/min; 145.6/min in the
+  flood without pacing, 39.2 with). A minimum wake of 5, 10 or 15 s with `maxDelayMs` 10 s did not
+  get there, since a flood window is `max(minWakeIntervalMs, maxDelayMs)`.

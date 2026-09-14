@@ -39,11 +39,16 @@ Known gaps (honest list):
   which costs one export to fill in (no loss). Scenario 13's 600-message surge right after a flood does
   exactly that (1 export). `--flood-pacing off` avoids it at one read per message.
 - Pacing only saves reads while a notice is held by `maxDelayMs` or `minWakeIntervalMs`. While `quietMs`
-  still drives a notice (the first `maxDelayMs - quietMs`, 8 s by default, of a flood from an idle room)
+  still drives a notice (the first `maxDelayMs - quietMs`, 5 s by default, of a flood from an idle room)
   the room is read live, because a late read would move the notice. Short floods therefore save little,
-  and with `minWakeIntervalMs` below `maxDelayMs` most of each window is read live.
+  and with `minWakeIntervalMs` below `maxDelayMs` most of each window is read live (the defaults keep it
+  above: 8 s against 7 s).
 - Pacing keeps notice times and contents identical only if a read completes within `repollLeadMs`
-  (500 ms). Against a slower origin, raise it.
+  (500 ms). Against a slower origin, raise it. A held long-poll on technocore-chat sees a post only at its
+  `CHAT_WAIT_POLL` tick (0.5 s), and paced reads line up with the flush, so in practice the last ~0.5 s of
+  a flood window lands in the next notice: in the dsh-technocore-watch W1 sweep (scale 0.25, local
+  server) flood wake p50 was 4.62 s with pacing and 4.41 s without, and a 1,000 or 1,500 ms lead did not
+  change it (4.60 / 4.61 s). Messages are not lost, only one window later.
 - `GET /r/<room>/export` is the only way to recover what a tail read skipped (no `before=` paging
   upstream, see #775), so a backfill can cost up to one ring download (bounded to 12 MiB / 2,000 records
   by default, one export at a time per origin).
@@ -219,8 +224,13 @@ posted after subscribing are neither delivered nor reported as a gap.
 ### Coalescing
 
 At most **one pending notice per scope**; new activity merges into it. It flushes after `quietMs` (2 s)
-without new activity or `maxDelayMs` (10 s) after the first event, whichever is first, but never sooner
-than `minWakeIntervalMs` (30 s) after the previous notice. Empty polls never produce a notice. Rooms per
+without new activity or `maxDelayMs` (7 s) after the first event, whichever is first, but never sooner
+than `minWakeIntervalMs` (8 s) after the previous notice. In a steady flood a notice therefore goes out
+every `max(minWakeIntervalMs, maxDelayMs)` (8 s), so flood messages wait about 4 s on average and at
+most 8 s. The defaults were tuned on W1 against a `wait_for_message` loop
+([dsh-technocore-watch sweep](https://github.com/OoJae/dsh-technocore-watch/tree/main/bench/results/sweep-2026-09-14)):
+the smallest number of model requests whose wake latency p50 and p95, overall and in the flood, stayed
+at or below the loop's (2 / 10 / 30 s before, whose flood p50 was about 15 s). Empty polls never produce a notice. Rooms per
 notice are capped at 16 (the rest become `more_rooms`). Gaps and recreation always surface.
 
 ### Notice format (`renderNotice`)
@@ -252,6 +262,7 @@ one-line form for monitors; `renderPage` frames inbox pages as one escaped JSON 
 | Gap records per room | 8 (settled ones pruned; touching gaps of the same reason merged; beyond that whole records dropped, oldest `backfill-bounded` first, so a gap never widens over delivered or retained seqs and `unread` can only over-count) |
 | Message cache | 2,000 messages per room, 64 rooms (least recently used evicted); a room is dropped when its last subscriber leaves |
 | Backfill | 12 MiB, 2,000 records, one export at a time |
+| Notice timing (`coalesce`) | `quietMs` 2,000 / `maxDelayMs` 7,000 / `minWakeIntervalMs` 8,000 |
 | Flood re-poll pacing | on; lead 500 ms (0..10,000), shortest nap 1,000 ms (100..10,000), longest nap = long-poll wait |
 | State file / notices journal | 256 KiB / 256 KiB ring |
 | Subscription GC | idle > 7 days with nothing unread (matches server deletion) |
@@ -358,11 +369,11 @@ Running them needs `uv` and a technocore-chat checkout at v0.13.0 with `uv sync 
 (`TECHNOCORE_SKIP_SLOW=1`); `npm test` runs everything.
 
 <!-- test-results:start -->
-Last full `npm test` after the flood re-poll pacing fixes (2026-09-14, Apple M5 16 GB, macOS 26, uv 0.11.14,
+Last full `npm test` after the default coalescing change (2026-09-14, Apple M5 16 GB, macOS 26, uv 0.11.14,
 technocore-chat v0.13.0 @20a4457, slow scenarios included): build + typecheck + secret scan OK, then
-**29 test files, 140 tests passed, 0 failed, 0 skipped** — unit 117, property 4, integration 19 — on
+**29 test files, 141 tests passed, 0 failed, 0 skipped** — unit 118, property 4, integration 19 — on
 **Node 26.0.0**. Node 20 and 22 were not re-run for this change (no local binaries; CI covers 20/22/24).
-Scenario 13 in two separate runs of its file: the 15 s, 300-message flood cost 67 and 76 room reads
+Scenario 13 (after the pacing fixes) in two separate runs of its file: the 15 s, 300-message flood cost 67 and 76 room reads
 (per notice window 44, 12, 11 in the run that printed them; the first window is read live while `quietMs`
 drives it), the pacing-off control 155 reads for 160 messages, 1 export for the surge, no gaps, and
 single messages were seen by the poll in 11-38 ms. The earlier pacing code read the flood 8 times, but it
@@ -398,8 +409,9 @@ notified seqs, 0 of 105 posts left out of a notice, 0 429s); its output was not 
   previous process's waiters; each led to a sleep, not a re-poll).
 - Notices: 26 (8 after the restart), 572-703 characters; **duplicate notified seqs: 0**; posts never covered
   by a notice: 0 of 1,523.
-- Flood latency is the coalescer doing its job: `minWakeIntervalMs` (30 s) caps wakes per scope, so a
-  flood produces one notice per 30 s instead of one per message. Burst latency is `quietMs` (2 s) plus the
+- Flood latency is the coalescer doing its job: `minWakeIntervalMs` (30 s, the default when this run was
+  recorded; 8 s now) caps wakes per scope, so a flood produced one notice per 30 s instead of one per
+  message. Burst latency is `quietMs` (2 s) plus the
   0.5 s server wake. The swept rooms account for the 9.2 s stage maximum (sweep interval 15 s).
 <!-- bench-results:end -->
 

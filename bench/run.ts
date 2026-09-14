@@ -13,6 +13,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { HostPool } from '../src/engine/host-pool.ts';
 import { createWatcher, type Watcher } from '../src/engine/watcher.ts';
+import { DEFAULT_COALESCE } from '../src/engine/types.ts';
 import { renderNotice } from '../src/protocol/render.ts';
 import { FileStateStore } from '../src/state/file-store.ts';
 import { startProxy } from '../tests/harness/counting-proxy.ts';
@@ -151,7 +152,7 @@ const meta = {
   hardware: `${cpus()[0]?.model ?? 'cpu'} x${cpus().length}, ${Math.round(totalmem() / 2 ** 30)} GiB, ${platform()} ${release()}`,
   node: process.version,
   technocore: 'technocore-chat v0.13.0 @20a4457 (local, CHAT_WAIT_POLL=0.5, CHAT_RATE_READ=600, CHAT_MAX_WAITERS_PER_IP=4)',
-  coalescer: 'quiet 2 s / max 10 s / min wake 30 s (defaults)',
+  coalescer: `quiet ${DEFAULT_COALESCE.quietMs / 1000} s / max ${DEFAULT_COALESCE.maxDelayMs / 1000} s / min wake ${DEFAULT_COALESCE.minWakeIntervalMs / 1000} s (defaults)`,
   workload: 'W1 without harness: 2 scopes x 3 subs (1 shared), idle, 8-burst, 5 msg/s flood, 45 s trickle, restart, singles',
 };
 const outDir = join(here, 'results');

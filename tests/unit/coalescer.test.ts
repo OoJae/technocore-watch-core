@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Coalescer, type FlushBatch, type RoomDelta } from '../../src/engine/coalescer.ts';
+import { DEFAULT_COALESCE } from '../../src/engine/types.ts';
 import { renderNotice } from '../../src/protocol/render.ts';
 import type { Message } from '../../src/protocol/types.ts';
 
@@ -30,7 +31,7 @@ describe('Coalescer (fake time)', () => {
 
   it('flushes by maxDelayMs under continuous activity, then respects minWakeIntervalMs', async () => {
     const out: { at: number; b: FlushBatch }[] = [];
-    const c = new Coalescer((b) => out.push({ at: Date.now(), b }));
+    const c = new Coalescer((b) => out.push({ at: Date.now(), b }), { quietMs: 2000, maxDelayMs: 10_000, minWakeIntervalMs: 30_000 });
     const start = Date.now();
     let seq = 0;
     const durationMs = 5 * 60_000;
@@ -63,6 +64,31 @@ describe('Coalescer (fake time)', () => {
     expect(out[0]!.moreRooms).toBe(4);
     expect(out[0]!.overflow).toHaveLength(4);
     expect(out[0]!.totalNew).toBe(40);
+  });
+
+  it('defaults: a flood gets its first notice after maxDelayMs (7 s), then one every minWakeIntervalMs (8 s), nothing lost', async () => {
+    expect(DEFAULT_COALESCE).toEqual({ quietMs: 2000, maxDelayMs: 7000, minWakeIntervalMs: 8000 });
+    const out: { at: number; b: FlushBatch }[] = [];
+    const c = new Coalescer((b) => out.push({ at: Date.now(), b }));
+    const start = Date.now();
+    let seq = 0;
+    while (Date.now() - start < 60_000) {
+      c.add(delta('flood', seq, 1));
+      seq += 1;
+      await vi.advanceTimersByTimeAsync(200); // 5 msg/s
+    }
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(out[0]!.at - start).toBe(7000);
+    // Held by minWakeIntervalMs: activity keeps arriving, yet each later window is exactly 8 s.
+    for (let i = 1; i < out.length - 1; i++) expect(out[i]!.at - out[i - 1]!.at).toBe(8000);
+    expect(out.length).toBe(8);
+    expect(out.reduce((n, o) => n + o.b.totalNew, 0)).toBe(seq);
+    // A single message after a quiet spell still goes out after quietMs.
+    const quietAt = Date.now();
+    c.add(delta('flood', seq, 1));
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(out.at(-1)!.at - quietAt).toBe(2000);
+    c.dispose();
   });
 
   it('surfaces gaps and recreation even with no new messages; dispose cancels timers', async () => {

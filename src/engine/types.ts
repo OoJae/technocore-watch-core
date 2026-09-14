@@ -125,7 +125,13 @@ export interface CoalesceOptions {
   minWakeIntervalMs: number;
 }
 
-export const DEFAULT_COALESCE: CoalesceOptions = { quietMs: 2000, maxDelayMs: 10_000, minWakeIntervalMs: 30_000 };
+/**
+ * Tuned on W1 (dsh-technocore-watch bench/results/sweep-2026-09-14): in a steady flood a notice window is
+ * max(minWakeIntervalMs, maxDelayMs), so wake latency there is roughly uniform over 8 s. minWakeIntervalMs
+ * above maxDelayMs keeps a flood's pending notice held by minWakeIntervalMs, which is what lets flood
+ * re-poll pacing nap.
+ */
+export const DEFAULT_COALESCE: CoalesceOptions = { quietMs: 2000, maxDelayMs: 7000, minWakeIntervalMs: 8000 };
 
 export type TransportKind = 'http-longpoll' | 'http-sweep';
 
