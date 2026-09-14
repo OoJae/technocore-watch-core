@@ -53,8 +53,11 @@ First version. Unofficial community integration — not affiliated with or endor
   time of a notice held by `maxDelayMs`/`minWakeIntervalMs`, `quietMs` before the due time of one that
   activity can still push out), capped at the long-poll wait and at half a read page at the measured
   rate, then reads live until the flush. It is woken early by a new subscriber, a slot change, a flushed
-  or dropped notice, unsubscribe or dispose. Notices go out at the same times with the same messages as
-  with pacing off. Against a local server (integration scenario 13) a 15 s flood at 20 msg/s cost 67-76
+  or dropped notice, unsubscribe or dispose. In fake-time tests, where every read completes within
+  `repollLeadMs`, notices go out at the same times with the same messages as with pacing off. Against
+  technocore-chat's 0.5 s `CHAT_WAIT_POLL` tick the last ~0.5 s of a flood window can move to the next
+  notice (dsh-technocore-watch W1 sweep at scale 0.25: flood wake p50 4.62 s with pacing, 4.41 s
+  without; no message lost). Against a local server (integration scenario 13) a 15 s flood at 20 msg/s cost 67-76
   room reads (about 300 before this change), with no seq lost, and single messages outside the flood
   were still seen by the poll in under 40 ms. Fake-time unit test: a 60 s flood at 5 msg/s costs 64
   reads instead of 300, 44 of them in the first window, which `quietMs` holds open, and 4 in each

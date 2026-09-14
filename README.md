@@ -93,6 +93,16 @@ npm link            # optional: puts `technocore-watch` on PATH
 
 Other packages in this workspace depend on it with `file:../technocore-watch-core`.
 
+### Releasing
+
+Push a tag `v<version>` that matches `package.json`; `.github/workflows/publish.yml` checks the tag,
+installs without lifecycle scripts, builds, runs the secret scan, type-check and unit tests, and publishes
+with provenance. npm trusted publishing can only be set up for a package that already exists, so the
+first version is published by that workflow with a short-lived granular access token in the `NPM_TOKEN`
+secret. After it, add the trusted publisher (`OoJae/technocore-watch-core`, `publish.yml`) on npmjs.com
+and delete the secret; later releases authenticate through OIDC. Update this README's Status and Install
+sections in the release commit, because the README published with a version cannot change afterwards.
+
 ## Library
 
 ```ts
@@ -226,8 +236,9 @@ posted after subscribing are neither delivered nor reported as a gap.
 At most **one pending notice per scope**; new activity merges into it. It flushes after `quietMs` (2 s)
 without new activity or `maxDelayMs` (7 s) after the first event, whichever is first, but never sooner
 than `minWakeIntervalMs` (8 s) after the previous notice. In a steady flood a notice therefore goes out
-every `max(minWakeIntervalMs, maxDelayMs)` (8 s), so flood messages wait about 4 s on average and at
-most 8 s. The defaults were tuned on W1 against a `wait_for_message` loop
+every `max(minWakeIntervalMs, maxDelayMs)` (8 s), so flood messages wait about 4 s on average and
+about 8 s at most (8.5 s measured in the W1 benchmark below: the 8 s window plus technocore-chat's 0.5 s
+long-poll tick). The defaults were tuned on W1 against a `wait_for_message` loop
 ([dsh-technocore-watch sweep](https://github.com/OoJae/dsh-technocore-watch/tree/main/bench/results/sweep-2026-09-14)):
 the smallest number of model requests whose wake latency p50 and p95, overall and in the flood, stayed
 at or below the loop's (2 / 10 / 30 s before, whose flood p50 was about 15 s). Empty polls never produce a notice. Rooms per
@@ -433,9 +444,14 @@ with a no-sleep assertion held; the longest stretch without an origin request wa
 Historical, superseded: [`bench/results/2026-09-13-fd67816-scale1.md`](bench/results/2026-09-13-fd67816-scale1.md)
 (one run at `fd67816`, before the review fixes, flood re-poll pacing and the default change; coalescing then
 2 s / 10 s / 30 s). Its flood and per-room read rates below were recomputed from its raw trace with the current
-report code.
+report code. That run **stalled**: its trace has no origin request for 108 s from workload minute 13.5 (15.9
+minutes in all, against 15.6 for the current run), which dsh-technocore-watch's 60 s rule would reject. Its
+whole-run rows (reads/min, reads per room-minute, notice totals) include the stall and are understated. The
+flood window (minutes 4-9) comes before it, flood messages are 1,493 of the 1,531 post x scope pairs behind
+the all-post latency, no post was made during the stall, and only the last single and trickle messages were
+posted after it.
 
-| metric | 2026-09-14 `bfbdaa6` (current) | 2026-09-13 `fd67816` (historical) |
+| metric | 2026-09-14 `bfbdaa6` (current) | 2026-09-13 `fd67816` (historical; stalled 108 s at min 13.5, whole-run rates understated) |
 |---|---|---|
 | wake latency p50 / p95 / max, all posts (ms) | 4430 / 8088 / 8679 | 14978 / 28758 / 30453 |
 | flood p50 / p95 (ms) | 4515 / 8088 | 15280 / 28779 |
@@ -447,9 +463,10 @@ report code.
 | duplicate notified seqs / posts never covered | 0 / 0 of 1,517 | 0 / 0 of 1,523 |
 | 429s / `wait_held:false` | 0 / 5 | 0 / 7 |
 
-The current defaults cut wake latency to about a third and flood reads to about a quarter, for twice the
-notices (each notice is one model turn in a harness). The old trace also has one unexplained 108 s stretch
-without any origin request from workload minute 13.5 (its posts were still covered by notices).
+The current defaults cut wake latency to about a third and flood reads (minutes 4-9) to about a quarter,
+for more notices: 37 against 10 during the flood (each notice is one model turn in a harness); the
+whole-run totals (54 vs 26) include the old run's stall. The stall is unexplained, and its posts were
+still covered by notices.
 <!-- bench-results:end -->
 
 ## Tested versions

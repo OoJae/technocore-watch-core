@@ -1,5 +1,11 @@
 # Publishing is a manual, approved step. This workflow only runs on a pushed version tag,
-# uses npm trusted publishing (OIDC) with provenance, and never runs from a fork.
+# publishes with provenance, and never runs from a fork.
+#
+# Authentication: npm trusted publishing (OIDC). A trusted publisher can only be added to a package
+# that already exists on npm, so the first version (0.1.0) uses a short-lived granular access token
+# stored as the NPM_TOKEN secret, still published from this workflow so it carries provenance. Then
+# add the trusted publisher (OoJae/technocore-watch-core, publish.yml) on npmjs.com and delete the
+# secret: with NPM_TOKEN unset npm authenticates through OIDC. See README, Releasing.
 name: publish
 on:
   push:
@@ -12,15 +18,31 @@ jobs:
     if: github.repository_owner == 'OoJae'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
       # Trusted publishing (OIDC) needs npm >= 11.5.1; make sure of it whatever npm Node 24 bundles.
       - run: npm install -g npm@^11.5.1
       - run: npm --version
-      - run: npm ci
+      - name: Check the tag matches package.json
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match package.json version v$version"
+            exit 1
+          fi
+      # No dependency lifecycle scripts in a job that can mint an OIDC token.
+      - run: npm ci --ignore-scripts
       - run: npm run build
+      - name: Verify (secret scan, type-check, unit and property tests)
+        run: |
+          npm run secret-scan
+          npm run typecheck
+          npm run test:unit
       - run: npm pack --dry-run
       - run: npm publish --provenance --access public
+        env:
+          # First release only (see above); leave the secret unset afterwards so npm uses OIDC.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

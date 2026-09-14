@@ -16,13 +16,13 @@ jobs:
         # A path with a space, on purpose: every script and harness must quote paths.
         working-directory: "work dir/technocore-watch-core"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           path: "work dir/technocore-watch-core"
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: ${{ matrix.node }}
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
       - name: Local technocore-chat v0.13.0 (test server only)
         working-directory: "work dir"
         run: |

@@ -30,6 +30,22 @@ describe('repository hygiene', () => {
     // Trusted publishing needs npm >= 11.5.1: Node 24 plus an explicit npm upgrade.
     expect(publish).toMatch(/node-version: 24\b/);
     expect(publish).toContain('npm install -g npm@^11.5.1');
+    // A tag that is not exactly v<package.json version> refuses; no dependency lifecycle scripts run in a
+    // job that can mint an OIDC token; the checks run before anything is published.
+    expect(publish).toContain('if [ "$GITHUB_REF_NAME" != "v$version" ]; then');
+    expect(publish).toContain('npm ci --ignore-scripts');
+    expect(publish).not.toMatch(/npm ci\s*$/m);
+    expect(publish).toMatch(/Check the tag matches package\.json[\s\S]*npm ci --ignore-scripts[\s\S]*npm run build[\s\S]*npm run secret-scan[\s\S]*npm run typecheck[\s\S]*npm run test:unit[\s\S]*npm publish --provenance/);
+    // The first release uses a short-lived token secret (the package must exist before a trusted publisher can be added).
+    expect(publish).toContain('NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}');
+  });
+
+  it('workflows use action majors that run on Node 24', () => {
+    for (const f of ['.github/workflows/ci.yml', '.github/workflows/publish.yml']) {
+      const uses = [...read(f).matchAll(/uses:\s*(\S+)/g)].map((m) => m[1]!);
+      expect(uses.length, f).toBeGreaterThan(0);
+      for (const u of uses) expect(['actions/checkout@v5', 'actions/setup-node@v5', 'astral-sh/setup-uv@v7'], `${f}: ${u}`).toContain(u);
+    }
   });
 
   it('no tracked or pending file contains an email address', () => {
