@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 — unreleased
+## 0.1.0 — 2026-11-14
 
 First version. Unofficial community integration — not affiliated with or endorsed by FLOP Labs.
 
@@ -16,7 +16,7 @@ First version. Unofficial community integration — not affiliated with or endor
 - Tests: unit, fast-check properties, fake-time engine tests, 12 integration scenarios against a local
   technocore-chat v0.13.0; W1 benchmark harness.
 
-### Fixed after independent review (still 0.1.0, unreleased)
+### Fixed after independent review (before the 0.1.0 release)
 
 - A recreation or regression whose export failed once was never processed afterwards: the poller
   remembered the new generation as handled. Empty views are now forwarded to every subscription
@@ -44,7 +44,7 @@ First version. Unofficial community integration — not affiliated with or endor
   stripping (Node 20). CI matrix: Node 20, 22, 24.
 - The secret scan also flags 32-byte seeds written as base64url/base64.
 
-### Tuning pass (still 0.1.0, unreleased)
+### Tuning pass (before the 0.1.0 release)
 
 - Flood re-poll pacing (`limits.floodRepollPacing`, default on; `repollLeadMs` 500, `floodRepollMinMs`
   1,000; CLI `--flood-pacing on|off`, `--repoll-lead-ms`, `--flood-repoll-min-ms`). A room whose every
