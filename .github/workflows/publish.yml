@@ -3,9 +3,13 @@
 #
 # Authentication: npm trusted publishing (OIDC). A trusted publisher can only be added to a package
 # that already exists on npm, so the first version (0.1.0) uses a short-lived granular access token
-# stored as the NPM_TOKEN secret, still published from this workflow so it carries provenance. Then
-# add the trusted publisher (OoJae/technocore-watch-core, publish.yml) on npmjs.com and delete the
-# secret: with NPM_TOKEN unset npm authenticates through OIDC. See README, Releasing.
+# stored as the NPM_TOKEN secret, still published from this workflow so it carries provenance. The
+# token needs "Read and write (publish and stage)" on All Packages and "Bypass two-factor
+# authentication"; a "stage only" token fails here with E_STAGE_REQUIRED. Delete the secret and the
+# token after 0.1.0. Add the trusted publisher (OoJae/technocore-watch-core, publish.yml, allowing
+# npm publish) on npmjs.com just before the next release: a new configuration expires if it has not
+# completed a publish within 2 days. With NPM_TOKEN unset npm authenticates through OIDC.
+# See README, Releasing.
 name: publish
 on:
   push:

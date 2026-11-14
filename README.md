@@ -102,11 +102,22 @@ npm link            # optional: puts `technocore-watch` on PATH
 
 Push a tag `v<version>` that matches `package.json`; `.github/workflows/publish.yml` checks the tag,
 installs without lifecycle scripts, builds, runs the secret scan, type-check and unit tests, and publishes
-with provenance. npm trusted publishing can only be set up for a package that already exists, so the
-first version is published by that workflow with a short-lived granular access token in the `NPM_TOKEN`
-secret. After it, add the trusted publisher (`OoJae/technocore-watch-core`, `publish.yml`) on npmjs.com
-and delete the secret; later releases authenticate through OIDC. Update this README's Status and Install
-sections in the release commit, because the README published with a version cannot change afterwards.
+with provenance.
+
+- **First version.** npm trusted publishing can only be set up for a package that already exists, so the
+  first version is published by that workflow with a short-lived granular access token in the `NPM_TOKEN`
+  repository secret: *Read and write (publish and stage)* on *All Packages* (a package that does not exist
+  yet cannot be selected), with *Bypass two-factor authentication* ticked, because a CI job cannot answer
+  a 2FA prompt. A *stage only* token does not work with this workflow: `npm publish` refuses it with
+  `E_STAGE_REQUIRED`. Delete the secret and the token once the version is out; npm plans to stop direct
+  publishing with bypass-2FA tokens in January 2027.
+- **Later versions.** Add the trusted publisher on npmjs.com (package Settings → Trusted publishing →
+  GitHub Actions: `OoJae`, `technocore-watch-core`, `publish.yml`, no environment) just before the release
+  it is for, and also allow `npm publish`: npm expires a new configuration that has not completed a publish
+  within 2 days, and configurations created since 3 September 2026 allow only `npm stage publish` unless
+  told otherwise. With `NPM_TOKEN` unset, the workflow authenticates through OIDC.
+- Update this README's Status and Install sections in the release commit, because the README published
+  with a version cannot change afterwards.
 
 ## Library
 
@@ -385,7 +396,12 @@ Running them needs `uv` and a technocore-chat checkout at v0.13.0 with `uv sync 
 (`TECHNOCORE_SKIP_SLOW=1`); `npm test` runs everything.
 
 <!-- test-results:start -->
-Last full `npm test` at `71d4bd8` (docs, publish workflow and its repository-hygiene test; `src` unchanged
+Re-run on 2026-11-14 at `0fce1f5` (`src` unchanged since `3a47f92`), Apple M5 16 GB, Node 26.0.0, uv
+0.11.14, slow scenarios included: build + typecheck + secret scan OK, then **30 test files, 144 tests
+passed, 0 failed, 0 skipped** with the local test server at technocore-chat `20a4457` (0.13.0), and the
+same result with it at upstream `main` `3cd868e` (0.14.5, the version technocore.chat reports).
+
+Full `npm test` before that, at `71d4bd8` (docs, publish workflow and its repository-hygiene test; `src` unchanged
 since `3a47f92`), 2026-09-14, Apple M5 16 GB, macOS 26.6.2, Node 26.0.0, slow scenarios included: build +
 typecheck + secret scan OK, then **30 test files, 144 tests passed, 0 failed, 0 skipped** (one test more
 than the run below: the workflows' action majors).
@@ -483,7 +499,7 @@ still covered by notices.
 
 | Component | Version |
 |---|---|
-| technocore-chat (local test server) | v0.13.0 @ 20a4457 |
+| technocore-chat (local test server) | v0.13.0 @ 20a4457; full suite also passes at upstream `main` @ 3cd868e (0.14.5), 2026-11-14 |
 | Node | 26.0.0 and 20.20.2 (engines: >= 20; `npm run bench` needs >= 22.18) |
 | TypeScript / vitest / fast-check | 5.9.3 / 4.1.11 / 4.10.0 |
 
